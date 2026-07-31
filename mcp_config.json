@@ -1,14 +1,24 @@
 {
+  "_comment": [
+    "Shadow-Core Sentinel speaks MCP over SSE, not stdio.",
+    "",
+    "This file previously declared:  \"command\": \"...\\dist\\shadow-core-sentinel.exe\"",
+    "which tells a client to SPAWN the exe and talk JSON-RPC over stdin/stdout.",
+    "But main.py runs mcp.run(transport='sse', host='127.0.0.1', port=7702), so",
+    "the process serves HTTP and never speaks stdio. A client using the old",
+    "config launches it, waits for stdio that never comes, and hangs.",
+    "",
+    "SSE servers are NOT spawned by the client -- Sentinel must already be",
+    "running. It starts at logon via the 'Shadow Core MCP Servers' scheduled",
+    "task. Verify with: curl http://127.0.0.1:7702/health",
+    "",
+    "Sentinel boots IDLE and watches nothing until a session calls",
+    "watch_project, so registering it costs nothing until it is used."
+  ],
   "mcpServers": {
     "shadow-core-sentinel": {
-      "command": "E:\\AI Backup Projects\\Shadow-Core Sentinel\\dist\\shadow-core-sentinel.exe",
-      "args": [],
-      "env": {
-        "WATCH_DIR": "E:\\AI Backup Projects\\Shadow-Core Sentinel",
-        "AUDIT_DIR": "E:\\AI Backup Projects\\Shadow-Core Sentinel\\audit_logs",
-        "DASHBOARD_ENABLED": "true",
-        "DASHBOARD_PORT": "7654"
-      }
+      "type": "sse",
+      "url": "http://127.0.0.1:7702/sse"
     }
   }
 }
