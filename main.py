@@ -53,14 +53,22 @@ class SentinelState:
     # `store` and `builder` used to be plain fields swapped by pivot_room. They
     # now resolve through the registry so the dashboard, the MCP tools and the
     # /health route keep working unchanged while several projects are watched.
+    # None when idle. Sentinel boots watching nothing, so every read-side
+    # caller must cope with there being no current project at all — that is the
+    # normal state between sessions, not an error.
+    def _primary_entry(self):
+        if not self.registry or self.primary is None:
+            return None
+        return self.registry.get(self.primary)
+
     @property
     def store(self):
-        entry = self.registry.get(self.primary) if self.registry else None
+        entry = self._primary_entry()
         return entry.store if entry else None
 
     @property
     def builder(self):
-        entry = self.registry.get(self.primary) if self.registry else None
+        entry = self._primary_entry()
         return entry.builder if entry else None
 
 
@@ -125,7 +133,7 @@ def main():
         handler=AuditEventHandler(),
         notifier=AmbientNotifier(str(settings.watch_dir)),
         registry=registry,
-        primary=Path(settings.watch_dir).resolve(),
+        primary=None,          # nothing watched until asked — see below
     )
 
     # Every event is ROUTED to the project that owns its path, rather than
@@ -145,10 +153,23 @@ def main():
     state.handler.subscribe(_record)
     state.handler.subscribe(state.notifier.on_event)
 
+    # IDLE ON BOOT. Sentinel starts with the PC and watches NOTHING until a
+    # session calls watch_project.
+    #
+    # It used to schedule whatever directory was watched last, which meant the
+    # service came up recording a project nobody had asked about — the running
+    # instance was found watching Shadow-Core Engineer purely because that was
+    # the last pivot, quietly accumulating events into an audit trail no one
+    # was reading. Idling also means no CPU spent hashing, and no growth in
+    # audit_logs, until monitoring is actually wanted.
+    #
+    # Watches are deliberately NOT persisted across restarts: "idle on boot"
+    # would be a lie if the previous session's watches came back.
     state.observer = start_bare_observer()
-    _entry = state.registry.add(state.primary)
-    _entry.handle = add_watch(state.observer, state.handler, _entry.path)
-    logger.info("File observer started — watching %s", _entry.path)
+    logger.info(
+        "File observer started — IDLE, watching nothing. "
+        "Call the watch_project tool to begin monitoring a directory."
+    )
     logger.info("AmbientNotifier active — signals → %s", Path.home() / ".shadow_core" / "projects")
 
     if settings.dashboard_enabled:

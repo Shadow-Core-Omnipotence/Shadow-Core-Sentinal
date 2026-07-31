@@ -215,8 +215,8 @@ def build_mcp_server(state) -> FastMCP:
         confirming its work against a directory nobody is recording. Watches
         cost very little to leave running.
 
-        Refuses to remove the last remaining watch, which would leave Sentinel
-        recording nothing at all.
+        Removing the last watch is allowed: Sentinel returns to idle, which is
+        also how it starts with the machine.
 
         Args:
             path: Absolute path of the project directory to stop watching.
@@ -230,20 +230,22 @@ def build_mcp_server(state) -> FastMCP:
         entry = state.registry.get(p)
         if entry is None:
             return {"status": "error", "message": f"Not being watched: {p}"}
-        if len(state.registry) == 1:
-            return {
-                "status": "error",
-                "message": "Refusing to unwatch the only project — Sentinel "
-                           "would be recording nothing.",
-            }
 
         from observer import remove_watch
         remove_watch(state.observer, entry.handle)
         state.registry.remove(p)
         if state.primary == entry.path:
-            state.primary = state.registry.entries()[0].path
+            # entries() is empty once the last watch goes, so index [0] would
+            # raise. None is the correct answer: Sentinel is idle again.
+            remaining = state.registry.entries()
+            state.primary = remaining[0].path if remaining else None
 
-        return {"status": "ok", "unwatched": str(p), "watching": state.registry.paths()}
+        return {
+            "status": "ok",
+            "unwatched": str(p),
+            "watching": state.registry.paths(),
+            "idle": len(state.registry) == 0,
+        }
 
     @mcp.tool()
     async def list_watched_projects() -> Dict:

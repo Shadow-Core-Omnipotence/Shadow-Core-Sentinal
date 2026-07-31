@@ -205,3 +205,42 @@ def test_a_store_that_fails_to_close_does_not_break_shutdown(registry, projects)
     ea.store.close = boom
     registry.close_all()           # must not raise
     assert len(registry) == 0
+
+
+# ── idle: the state Sentinel now BOOTS into ─────────────────────────────────
+def test_a_new_registry_is_empty(registry):
+    """Sentinel starts with the PC and watches nothing until asked.
+
+    It used to schedule whatever was watched last, so the service came up
+    recording a project nobody had asked about -- the running instance was
+    found watching Shadow-Core Engineer purely because that was the last pivot.
+    """
+    assert len(registry) == 0
+    assert registry.paths() == []
+    assert registry.entries() == []
+
+
+def test_routing_while_idle_returns_nothing(registry, tmp_path):
+    """Every read path must survive having no project at all. Between sessions
+    that is the NORMAL state, not an error."""
+    assert registry.route(tmp_path / "anything.py") is None
+
+
+def test_removing_the_last_watch_returns_to_idle(registry, projects):
+    """Idle is a legitimate destination, not a failure to be refused."""
+    a, _ = projects
+    registry.add(a)
+    registry.remove(a)
+
+    assert len(registry) == 0
+    assert registry.route(a / "file.py") is None
+
+
+def test_watching_can_resume_after_going_idle(registry, projects):
+    a, b = projects
+    registry.add(a)
+    registry.remove(a)
+
+    entry = registry.add(b)
+    assert len(registry) == 1
+    assert registry.route(b / "x.py") is entry
