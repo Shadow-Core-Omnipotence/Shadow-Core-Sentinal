@@ -2,14 +2,14 @@
 import os
 from PyInstaller.utils.hooks import collect_all
 
-# TASK-S06 — Resolve Engineer dir relative to the spec, not hardcoded absolute.
-# Sentinel imports `telemetry` from Engineer at runtime (mcp_server.py).
+# Sentinel is STANDALONE (2026-07-31). It used to add a sibling project's
+# directory to pathex and pull in its `telemetry` module for tracing
+# middleware. That import had been failing silently for some time --
+# TraceMiddleware was deleted from Engineer during its Bare SDK migration --
+# so the coupling bought nothing while making this spec raise
+# FileNotFoundError on any machine without Shadow-Core Engineer checked out
+# next to it. The build now depends on nothing outside this directory.
 _HERE = os.path.dirname(os.path.abspath(SPEC))
-_ENGINEER_DIR = os.path.abspath(os.path.join(_HERE, '..', 'Shadow-Core Engineer'))
-if not os.path.exists(_ENGINEER_DIR):
-    raise FileNotFoundError(
-        f"Engineer dir not found at expected location: {_ENGINEER_DIR}"
-    )
 
 datas = []
 binaries = []
@@ -55,10 +55,10 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 a = Analysis(
     ['main.py'],
-    pathex=[_ENGINEER_DIR],
+    pathex=[_HERE],
     binaries=binaries,
     datas=datas,
-    hiddenimports=hiddenimports + ['telemetry'],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import logging
-import sys
-import os
 from datetime import datetime, timezone
 from typing import Dict
 
@@ -13,24 +11,30 @@ from fastmcp import FastMCP
 
 from config import settings
 from differ import diff_strings
-try:
-    _SENTINEL_DIR = os.path.dirname(os.path.abspath(__file__))
-    _ENG_DIR = os.path.join(_SENTINEL_DIR, '..', 'Shadow-Core Engineer')
-    if _ENG_DIR not in sys.path:
-        sys.path.insert(0, _ENG_DIR)
-    from telemetry import TraceMiddleware
-    _HAS_TELEMETRY = True
-except ImportError:
-    _HAS_TELEMETRY = False
-    logging.getLogger("sc.sentinel.mcp").warning("Telemetry module unavailable — trace IDs will not be injected")
+
+# NOTE (2026-07-31): this module used to reach into a SIBLING PROJECT --
+# `sys.path.insert(0, '../Shadow-Core Engineer')` followed by
+# `from telemetry import TraceMiddleware` -- to add tracing middleware.
+#
+# That import had been FAILING silently. TraceMiddleware was deleted from
+# Engineer's telemetry.py during its Phase-1 Bare SDK migration; the note left
+# in that file says per-request tracing moved to a `@traced` decorator instead.
+# Sentinel's try/except caught the ImportError, logged one warning, and ran
+# without middleware. Verified before removal: the import raises
+# "cannot import name 'TraceMiddleware' from 'telemetry'".
+#
+# So the coupling bought nothing and cost portability -- it is why the
+# PyInstaller spec hardcoded an absolute path to another project's directory
+# (TECH_DEBT_AUDIT.md #6), which breaks on any other machine.
+#
+# If tracing is wanted again, Engineer's `traced` decorator is the current
+# surface. Vendor it or depend on it deliberately; do not resurrect a
+# relative-path sys.path hack.
 
 logger = logging.getLogger("sc.sentinel.mcp")
 
 # ── Module-level FastMCP instance (replaces Server factory) ───────────────
 mcp = FastMCP("shadow-core-sentinel")
-
-if _HAS_TELEMETRY:
-    mcp.add_middleware(TraceMiddleware())
 
 
 def build_mcp_server(state) -> FastMCP:
