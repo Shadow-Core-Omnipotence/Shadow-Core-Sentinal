@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "shadow-core-sentinel": {
+      "command": "E:\\AI Backup Projects\\Shadow-Core Sentinel\\dist\\shadow-core-sentinel.exe",
+      "args": [],
+      "env": {
+        "WATCH_DIR": "E:\\AI Backup Projects\\Shadow-Core Sentinel",
+        "AUDIT_DIR": "E:\\AI Backup Projects\\Shadow-Core Sentinel\\audit_logs",
+        "DASHBOARD_ENABLED": "true",
+        "DASHBOARD_PORT": "7654"
+      }
+    }
+  }
+}

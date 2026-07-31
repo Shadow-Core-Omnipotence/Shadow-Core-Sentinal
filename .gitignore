@@ -1,0 +1,39 @@
+# TASK-S08 — Sentinel repository ignores
+
+# Build artefacts
+build/
+dist/
+*.pyc
+*.pyo
+__pycache__/
+
+# Virtual environments
+.venv*/
+venv/
+
+# Logs and runtime debris
+*.log
+*.tmp
+sentinel_err.log
+sentinel_out.log
+test_event.tmp
+
+# Audit / observation output (runtime data, not source)
+audit_logs/
+scratch/
+watched/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local override configs
+.env
+.env.local
+*.local.json
+
+# Runtime databases and other tools' backups
+.mempalace.db
+.shadow_engineer_backups/
