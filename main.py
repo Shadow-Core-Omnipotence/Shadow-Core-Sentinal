@@ -242,6 +242,36 @@ def main():
             except Exception as e:
                 return {"status": "error", "message": str(e)}
 
+        def do_rollback() -> dict:
+            """Return the default view to the previously watched project.
+
+            Now that watches are additive, this does NOT re-schedule anything in
+            the common case — the previous project is usually still watched, so
+            rollback only moves `primary` back. The watch is re-added only if it
+            was explicitly removed in the meantime.
+            """
+            prev = settings.rollback_watch_dir()
+            if prev is None:
+                return {"status": "error", "message": "No previous path"}
+            try:
+                prev = Path(prev).resolve()
+                entry = state.registry.get(prev)
+                if entry is None:
+                    if not prev.is_dir():
+                        return {"status": "error",
+                                "message": f"Previous path no longer exists: {prev}"}
+                    entry = state.registry.add(prev)
+                    entry.handle = add_watch(state.observer, state.handler, entry.path)
+                state.primary = entry.path
+                return {
+                    "status": "ok",
+                    "restored_path": str(prev),
+                    "project_name": entry.project_name,
+                    "watching": state.registry.paths(),
+                }
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
         def do_audit(label: str, mode: str) -> dict:
             if mode == "disk":
                 snap = state.builder.build_disk_snapshot(label)
