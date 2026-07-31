@@ -40,3 +40,6 @@ Thumbs.db
 
 # Rust dashboard build output
 dashboard-rs/target/
+
+# pytest
+.pytest_cache/
