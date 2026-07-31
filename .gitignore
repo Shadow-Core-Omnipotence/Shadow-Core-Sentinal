@@ -37,3 +37,6 @@ Thumbs.db
 # Runtime databases and other tools' backups
 .mempalace.db
 .shadow_engineer_backups/
+
+# Rust dashboard build output
+dashboard-rs/target/

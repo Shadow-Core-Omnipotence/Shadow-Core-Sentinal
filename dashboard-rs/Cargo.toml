@@ -1,0 +1,23 @@
+[package]
+name = "sentinel-dashboard"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone Rust dashboard for Shadow-Core Sentinel"
+
+[dependencies]
+# Server. axum brings its own router/extractors; tokio drives it.
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+
+# `bundled` compiles SQLite into the binary. Deliberate: the whole point of this
+# rewrite is one artefact with no runtime dependency to install or mis-resolve.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
