@@ -192,6 +192,12 @@ def build_mcp_server(state) -> FastMCP:
             # ever had `watch_dir`, singular, so this always reported an empty
             # list. Someone had anticipated multi-watch; now it exists.
             "watch_paths": state.registry.paths() if state.registry else [],
+            # Suspended watches still appear in watch_paths — they are watched,
+            # just not currently scheduled. Listing them separately keeps a
+            # caller from reading "watched" as "recording right now".
+            "suspended_watches": [
+                str(e.path) for e in state.registry.suspended_entries()
+            ] if state.registry else [],
             "primary_watch": str(state.primary) if state.primary else None,
             "total_events": state.store.total_count() if state.store else 0,
             "observer_alive": state.observer.is_alive() if hasattr(state.observer, "is_alive") else "unknown",
@@ -237,8 +243,13 @@ def build_mcp_server(state) -> FastMCP:
         what was assumed.
 
         Additive and safe to repeat: other projects already being watched are
-        NOT affected, and re-calling it for a directory already watched is a
-        no-op. Several sessions can each watch their own project at once.
+        NOT affected. Several sessions can each watch their own project at once.
+
+        A project with no activity for a while SUSPENDS itself — still
+        registered, with its history intact, but not currently recording.
+        Calling this again resumes it, and any changes made while it was
+        suspended are reconstructed into the trail from a SHA-256 comparison,
+        marked as detected-on-resume rather than observed live.
 
         Args:
             path: Absolute path of the project directory to watch.
@@ -255,15 +266,28 @@ def build_mcp_server(state) -> FastMCP:
         if not p.is_dir():
             return {"status": "error", "message": f"Not a directory: {p}"}
 
-        already = state.registry.get(p) is not None
+        existing = state.registry.get(p)
+        already = existing is not None
         entry = state.registry.add(p)
         if not already:
             from observer import add_watch
             entry.handle = add_watch(state.observer, state.handler, entry.path)
 
+        # An idle watch suspends itself rather than being removed, so a repeat
+        # call may be re-arming one that is still registered but not scheduled.
+        # Without this it would report "already_watching" while recording
+        # nothing — the precise kind of confident wrongness this tool exists to
+        # avoid. Resuming also reconstructs whatever changed while it was down.
+        resumed = False
+        if entry.suspended and state.resume:
+            resumed = bool(state.resume(entry, reason="watch_project"))
+        else:
+            entry.touch()
+
         return {
             "status": "ok",
             "already_watching": already,
+            "resumed_from_idle": resumed,
             "path": str(entry.path),
             "project_name": entry.project_name,
             "watching": state.registry.paths(),

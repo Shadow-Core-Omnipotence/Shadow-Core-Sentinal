@@ -35,6 +35,13 @@ class Settings:
 
     log_level: str = os.environ.get("LOG_LEVEL", "INFO")
 
+    # Idle watches suspend themselves after this long with no events and no
+    # prompt (see lease.py). Suspension is not removal — the entry, its store
+    # and its history survive, and the next prompt in that project resumes it.
+    # 0 disables suspension entirely.
+    watch_idle_ttl_seconds: int = int(os.environ.get("WATCH_IDLE_TTL_SECONDS", "3600"))
+    watch_sweep_seconds: int = int(os.environ.get("WATCH_SWEEP_SECONDS", "60"))
+
     ignore_patterns: List[str] = field(
         default_factory=lambda: [
             # NOTE: plain "venv" as well as ".venv". Measured 2026-07-31 while
@@ -44,7 +51,20 @@ class Settings:
             # 1.3 GB of virtualenv churn drowns the signal the trail exists for.
             "node_modules", ".git", ".venv", ".venv311", "venv", "env",
             "__pycache__", "site-packages",
-            "*.tmp", ".DS_Store", "target", "dist", "build",
+            # "*.tmp.*" as well as "*.tmp". Measured 2026-07-31: an atomic
+            # editor write leaves `main.py.tmp.15328.5bb47c1b481e`, which the
+            # plain "*.tmp" glob does not match. One edit was producing four
+            # rows, three of them about a scratch file that no longer exists.
+            # "build_*"/"dist_*" as well as the bare names. Measured
+            # 2026-07-31: a staged PyInstaller rebuild into build_new/ and
+            # dist_new/ put ~30 rows of DELETED bootloader artifacts into the
+            # trail when the staging dirs were cleaned up. Deliberately NOT
+            # "build*"/"dist*" — that glob matches on any path component, so it
+            # would silently swallow real source directories called
+            # "distributed", "distribution" or "builder".
+            "*.tmp", "*.tmp.*", ".DS_Store", "target", "dist", "build",
+            "build_*", "dist_*",
+            "*~", "*.swp", "*.swx", "*.orig", "*.rej",
             "*.pyc", "*.pyo", ".mypy_cache", ".pytest_cache",
             "sentinel.db", "sentinel.db-journal",
             ".idea", ".vscode", "*.log",

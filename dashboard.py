@@ -527,6 +527,70 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+  /* Project tabs — one per watched project */
+  .tab-strip {
+    display: flex;
+    align-items: stretch;
+    gap: 2px;
+    padding: 0 2rem;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+  }
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.6rem 1rem;
+    font-size: 0.75rem;
+    color: var(--muted);
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    font-family: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color .15s, border-color .15s, background .15s;
+  }
+  .tab:hover { color: var(--text); background: var(--surface2); }
+  .tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+    background: var(--accent-dim);
+  }
+  .tab-count {
+    font-size: 0.65rem;
+    padding: 1px 6px;
+    border-radius: 10px;
+    background: var(--surface2);
+    color: var(--muted);
+  }
+  .tab.active .tab-count { background: var(--accent); color: var(--bg); }
+  .tab-live {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 6px var(--green);
+  }
+  /* Suspended: dimmed but still selectable. Its history is intact and the
+     next prompt in that project re-arms it. */
+  .tab.suspended { opacity: 0.45; }
+  .tab.suspended.active { opacity: 0.75; }
+  .tab-idle {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--muted);
+    border: 1px solid var(--border2);
+  }
+  .tab-empty {
+    padding: 0.6rem 1rem;
+    font-size: 0.75rem;
+    color: var(--muted);
+  }
+  .scope-note {
+    font-size: 0.6rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
 </style>
 </head>
 <body>
@@ -548,11 +612,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 </header>
 
+<!-- Project tabs. Selecting one changes only what THIS browser requests;
+     it does not move the server's primary or touch another session. -->
+<div class="tab-strip" id="tab-strip">
+  <div class="tab-empty">No projects watched — call watch_project, or pivot below.</div>
+</div>
+
 <main>
 
   <!-- Watch path bar -->
   <div class="watch-bar">
-    <span class="watch-label">Watching</span>
+    <span class="watch-label">Viewing</span>
     <div>
       <span class="watch-path" id="watch-path">—</span>
       <div style="font-size:0.65rem;color:var(--accent);margin-top:2px"
@@ -585,7 +655,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="stat-card red">
       <div class="stat-label">Ignore Patterns</div>
       <div class="stat-value" id="stat-patterns">—</div>
-      <div class="stat-sub">active filters</div>
+      <div class="stat-sub scope-note">global — all projects</div>
     </div>
   </div>
 
@@ -676,10 +746,73 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   let countdown = 5;
   let stats = {};
   let events = [];
+  let projects = [];
+
+  // Which project this browser is looking at. Kept CLIENT-side so two windows
+  // can watch two projects at once; the server's primary is never moved by
+  // clicking a tab. Survives refresh, and falls back to the primary when the
+  // remembered project is no longer watched.
+  let currentProject = localStorage.getItem('sentinel.project') || null;
+
+  function scoped(url) {
+    return currentProject
+      ? url + '?project=' + encodeURIComponent(currentProject)
+      : url;
+  }
+
+  function selectProject(key) {
+    currentProject = key;
+    if (key) localStorage.setItem('sentinel.project', key);
+    else localStorage.removeItem('sentinel.project');
+    renderTabs();
+    refresh();
+  }
+
+  async function fetchProjects() {
+    try {
+      const r = await fetch('/api/projects');
+      projects = await r.json();
+      // A remembered project that is no longer watched would otherwise pin the
+      // view to a dead tab and silently show the primary's numbers under its
+      // name. Drop the selection and fall back.
+      if (currentProject && !projects.some(p => p.key === currentProject)) {
+        currentProject = null;
+        localStorage.removeItem('sentinel.project');
+      }
+      if (!currentProject) {
+        const primary = projects.find(p => p.is_primary) || projects[0];
+        if (primary) currentProject = primary.key;
+      }
+      renderTabs();
+    } catch(e) { console.error('Projects fetch error', e); }
+  }
+
+  function renderTabs() {
+    const strip = document.getElementById('tab-strip');
+    if (!projects.length) {
+      strip.innerHTML = '<div class="tab-empty">No projects watched — call watch_project, or pivot below.</div>';
+      return;
+    }
+    strip.innerHTML = projects.map(p => {
+      const active = p.key === currentProject ? ' active' : '';
+      const idle = p.suspended ? ' suspended' : '';
+      const dot = p.suspended
+        ? '<span class="tab-idle" title="Suspended for inactivity — resumes on your next prompt"></span>'
+        : (p.live_events > 0 ? '<span class="tab-live"></span>' : '');
+      const tip = p.suspended
+        ? `${p.path}\nSUSPENDED — idle ${Math.round(p.idle_seconds / 60)} min. Resumes on your next prompt in this project.`
+        : p.path;
+      return `<button class="tab${active}${idle}" title="${tip}"
+                onclick="selectProject('${p.key.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}')">
+                ${dot}<span>${p.name}</span>
+                <span class="tab-count">${p.db_events.toLocaleString()}</span>
+              </button>`;
+    }).join('');
+  }
 
   async function fetchStats() {
     try {
-      const r = await fetch('/api/stats');
+      const r = await fetch(scoped('/api/stats'));
       stats = await r.json();
       renderStats();
     } catch(e) { console.error('Stats fetch error', e); }
@@ -687,7 +820,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   async function fetchEvents() {
     try {
-      const r = await fetch('/api/events');
+      const r = await fetch(scoped('/api/events'));
       events = await r.json();
       renderFeed();
     } catch(e) { console.error('Events fetch error', e); }
@@ -695,15 +828,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   async function fetchSnapshots() {
     try {
-      const r = await fetch('/api/snapshots');
+      const r = await fetch(scoped('/api/snapshots'));
       const snaps = await r.json();
       renderSnapshots(snaps);
     } catch(e) {}
   }
 
   function renderStats() {
-    document.getElementById('watch-path').textContent = stats.watch_dir || '—';
-    document.getElementById('project-name').textContent = '📁 ' + (stats.project_name || '');
+    document.getElementById('watch-path').textContent = stats.watch_dir || 'Nothing watched';
+    document.getElementById('project-name').textContent =
+      stats.project_name ? '📁 ' + stats.project_name : '';
     document.getElementById('stat-db').textContent = (stats.total_db_events || 0).toLocaleString();
     document.getElementById('stat-mem').textContent = (stats.memory_events || 0).toLocaleString();
     document.getElementById('stat-alerts').textContent = (stats.recent_alerts || 0);
@@ -741,10 +875,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       feed.innerHTML = '<div class="feed-empty"><span>⏳</span><span>Waiting for filesystem events...</span></div>';
       return;
     }
+    // Paths are shown RELATIVE TO THE PROJECT ROOT, not as the last two
+    // segments. Truncating to two segments renders `backend/main.py` and
+    // `tools/backend/main.py` identically, and same-named files are the norm
+    // across and within projects — the row has to say which one changed.
+    const root = (stats.watch_dir || '').replace(/\\/g, '/').replace(/\/+$/, '');
     const rows = [...events].reverse().map(e => {
       const ts = new Date(e.ts).toLocaleTimeString('en', {hour12: false, hour:'2-digit', minute:'2-digit', second:'2-digit'});
       const hash = e.sha256 ? e.sha256.substring(0, 8) + '...' : '—';
-      const path = e.src_path.replace(/\\/g, '/').split('/').slice(-2).join('/');
+      const full = e.src_path.replace(/\\/g, '/');
+      const path = (root && full.toLowerCase().startsWith(root.toLowerCase() + '/'))
+        ? full.slice(root.length + 1)
+        : full;
       return `<div class="event-row">
         <span class="event-ts">${ts}</span>
         <span class="event-kind kind-${e.kind}">${e.kind}</span>
@@ -780,7 +922,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const d = await r.json();
       if (d.status === 'ok') {
         document.getElementById('pivot-input').value = '';
-        fetchStats();
+        // Pivot ADDS a watch. Jump this browser to the new project's tab.
+        await fetchProjects();
+        selectProject(d.new_watch_path);
       } else {
         alert('Pivot failed: ' + (d.message || JSON.stringify(d)));
       }
@@ -791,7 +935,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     try {
       const r = await fetch('/api/rollback', { method: 'POST' });
       const d = await r.json();
-      fetchStats();
+      await fetchProjects();
+      if (d.status === 'ok') selectProject(d.restored_path);
+      else refresh();
     } catch(e) {}
   }
 
@@ -804,7 +950,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const r = await fetch('/api/audit', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({label, mode})
+        body: JSON.stringify({label, mode, project: currentProject})
       });
       const d = await r.json();
       resultEl.textContent = d.snapshot_uri || JSON.stringify(d);
@@ -834,7 +980,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       countdown <= 0 ? 'Refreshing...' : `Refreshing in ${countdown}s`;
     if (countdown <= 0) {
       countdown = 5;
-      refresh();
+      refreshAll();
     }
   }
 
@@ -844,32 +990,53 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     fetchSnapshots();
   }
 
-  refresh();
+  async function refreshAll() {
+    // Tabs first: the project list decides what everything else is scoped to.
+    await fetchProjects();
+    refresh();
+  }
+
+  refreshAll();
   setInterval(tick, 1000);
 </script>
 </body>
 </html>"""
 
 
-def _make_handler(get_stats: Callable[[], dict], get_events: Callable[[], list],
-                  get_snapshots: Callable[[], list], do_pivot: Callable[[str], dict],
-                  do_rollback: Callable[[], dict], do_audit: Callable[[str, str], dict],
+def _make_handler(get_stats: Callable[..., dict], get_events: Callable[..., list],
+                  get_snapshots: Callable[..., list], get_projects: Callable[[], list],
+                  do_pivot: Callable[[str], dict],
+                  do_rollback: Callable[[], dict], do_audit: Callable[..., dict],
                   do_ignore: Callable[[str], dict]):
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             pass
 
+        def _project(self):
+            """`?project=<abs path>` — which project this request is about.
+
+            Scoping travels in the REQUEST rather than in server state, so two
+            browser tabs can view two projects at once and neither disturbs the
+            other or the primary. Absent means "the primary", which is what a
+            freshly opened dashboard asks for.
+            """
+            q = parse_qs(urlparse(self.path).query)
+            vals = q.get('project') or []
+            return vals[0] if vals and vals[0] else None
+
         def do_GET(self):
             p = urlparse(self.path).path
             if p in ('/', '/index.html'):
                 self._html(DASHBOARD_HTML)
             elif p == '/api/stats':
-                self._json(get_stats())
+                self._json(get_stats(self._project()))
             elif p == '/api/events':
-                self._json(get_events())
+                self._json(get_events(self._project()))
             elif p == '/api/snapshots':
-                self._json(get_snapshots())
+                self._json(get_snapshots(self._project()))
+            elif p == '/api/projects':
+                self._json(get_projects())
             else:
                 self.send_response(404); self.end_headers()
 
@@ -882,7 +1049,9 @@ def _make_handler(get_stats: Callable[[], dict], get_events: Callable[[], list],
             elif p == '/api/rollback':
                 self._json(do_rollback())
             elif p == '/api/audit':
-                self._json(do_audit(body.get('label', 'dashboard'), body.get('mode', 'disk')))
+                self._json(do_audit(body.get('label', 'dashboard'),
+                                    body.get('mode', 'disk'),
+                                    body.get('project') or self._project()))
             elif p == '/api/ignore':
                 self._json(do_ignore(body.get('pattern', '')))
             else:
@@ -908,9 +1077,9 @@ def _make_handler(get_stats: Callable[[], dict], get_events: Callable[[], list],
     return Handler
 
 
-def start_dashboard(port: int, get_stats, get_events, get_snapshots,
+def start_dashboard(port: int, get_stats, get_events, get_snapshots, get_projects,
                     do_pivot, do_rollback, do_audit, do_ignore) -> threading.Thread:
-    handler = _make_handler(get_stats, get_events, get_snapshots,
+    handler = _make_handler(get_stats, get_events, get_snapshots, get_projects,
                             do_pivot, do_rollback, do_audit, do_ignore)
     server = HTTPServer(('127.0.0.1', port), handler)
 

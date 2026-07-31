@@ -141,15 +141,54 @@ class AuditEventHandler(FileSystemEventHandler):
         if event.is_directory:
             return
         src = Path(event.src_path)
-        if settings.is_ignored(src):
+        dest = Path(event.dest_path)
+
+        if settings.is_ignored(dest):
             return
+
+        # ATOMIC REPLACE. Editors (including Claude Code's own Edit tool) write
+        # a scratch file and rename it over the target, which arrives here as a
+        # move FROM an ignored temp path INTO a real one:
+        #
+        #   CREATED   main.py.tmp.15328.5bb47c1b481e   <- ignored
+        #   MODIFIED  main.py.tmp.15328.5bb47c1b481e   <- ignored
+        #   MOVED     main.py.tmp...  ->  main.py      <- this
+        #
+        # Returning early on an ignored src would drop the rename and lose the
+        # edit entirely — the temp file is noise, but the rename IS the write.
+        # Reported as a MODIFIED of the destination, because that is what
+        # changed. (Whether the destination previously existed is not knowable
+        # here, so a brand-new file written this way reads as MODIFIED. The
+        # path and the SHA — the parts used to verify a change — are exact.)
+        if settings.is_ignored(src):
+            self._alert_manager.record()
+            self._executor.submit(self._process, EventKind.MODIFIED, dest)
+            return
+
         self._alert_manager.record()
-        self._executor.submit(self._process, EventKind.MOVED, src, Path(event.dest_path))
+        self._executor.submit(self._process, EventKind.MOVED, src, dest)
 
     def _process(self, kind: EventKind, src: Path, dest: Optional[Path] = None) -> None:
         target = dest if dest else src
         if settings.is_ignored(target):
             return
+
+        # A DELETED for a path that still exists is not a deletion. The atomic
+        # replace above ends by tearing down the original inode, which arrives
+        # as a delete of the destination ~60ms AFTER the rename that created it
+        # — so every single edit recorded a phantom "DELETED main.py" for a file
+        # that was right there on disk.
+        #
+        # That is worse than noise: a caller asking Sentinel to confirm an edit
+        # landed would read that row and conclude the file had been removed.
+        # Checking the filesystem is the honest test — if it is there now, it
+        # was not deleted, whatever the event stream claims. A real delete
+        # followed by a fast recreate loses the delete row but still ends up
+        # describing the file that exists, which is the answer that matters.
+        if kind is EventKind.DELETED and target.exists():
+            logger.debug("Suppressed phantom DELETE (file still exists): %s", target)
+            return
+
         self._emit(AuditEvent(kind=kind, src_path=src, dest_path=dest, sha256=sha256_of(target)))
 
     def _emit(self, event: AuditEvent) -> None:

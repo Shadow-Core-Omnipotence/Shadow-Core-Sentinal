@@ -19,9 +19,26 @@ _EMOJI: Dict[EventKind, str] = {
 }
 
 class ReportBuilder:
-    def __init__(self, audit_dir: Path) -> None:
+    """Writes one project's audit artifacts.
+
+    `watch_path` is passed in rather than read from `settings.watch_dir`.
+    A builder is created per watched project and writes into that project's
+    audit_dir, but it used to take the directory to inventory — and the path
+    printed in every report header — from the global. With two projects
+    watched, a disk snapshot requested for project B walked whichever tree
+    happened to be primary and filed the result under B, producing an audit
+    artifact that is confidently about the wrong project. Falls back to the
+    global when not supplied, so single-watch callers are unaffected.
+    """
+
+    def __init__(self, audit_dir: Path, watch_path: Optional[Path] = None) -> None:
         self._audit_dir = audit_dir
+        self._watch_path = Path(watch_path) if watch_path else None
         self._lock = threading.Lock()
+
+    @property
+    def watch_path(self) -> Path:
+        return self._watch_path if self._watch_path is not None else settings.watch_dir
 
     def append_event(self, evt: AuditEvent) -> Path:
         date_key = evt.date_key()
@@ -43,7 +60,7 @@ class ReportBuilder:
             "",
             f"> **Generated:** {ts.isoformat(timespec='milliseconds')}Z",
             f"> **Events captured:** {len(events)}",
-            f"> **Watched directory:** `{settings.watch_dir}`",
+            f"> **Watched directory:** `{self.watch_path}`",
             "",
             "## Events",
             "",
@@ -63,7 +80,7 @@ class ReportBuilder:
 
     def build_disk_snapshot(self, label: str = "disk") -> Path:
         entries: List[tuple[Path, Optional[str]]] = []
-        for root, dirs, files in os.walk(settings.watch_dir):
+        for root, dirs, files in os.walk(self.watch_path):
             dirs[:] = [d for d in dirs if not settings.is_ignored(Path(root) / d)]
             for name in sorted(files):
                 fpath = Path(root) / name
@@ -78,7 +95,7 @@ class ReportBuilder:
             f"# Disk State Snapshot — {label}",
             "",
             f"> **Generated:** {ts.isoformat(timespec='milliseconds')}Z",
-            f"> **Watched directory:** `{settings.watch_dir}`",
+            f"> **Watched directory:** `{self.watch_path}`",
             f"> **Files inventoried:** {len(entries)}",
             "",
             "## File Inventory",
@@ -112,7 +129,7 @@ class ReportBuilder:
         header = "\n".join([
             f"# Folder Audit Log — {date_key}",
             "",
-            f"> **Watched directory:** `{settings.watch_dir}`",
+            f"> **Watched directory:** `{self.watch_path}`",
             f"> **Report generated:** {datetime.now(tz=timezone.utc).isoformat(timespec='milliseconds')}Z",
             "",
             "## Events",

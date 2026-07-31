@@ -32,8 +32,9 @@ class FakeStore:
 
 
 class FakeBuilder:
-    def __init__(self, audit_dir):
+    def __init__(self, audit_dir, watch_path):
         self.audit_dir = audit_dir
+        self.watch_path = watch_path
 
 
 @pytest.fixture

@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -69,6 +71,24 @@ class WatchEntry:
     handle: object = None
     _key: str = field(default="", repr=False)
 
+    # ── lease (see lease.py) ────────────────────────────────────────────────
+    # A watch idle past the TTL is SUSPENDED, never removed: unscheduled from
+    # the observer while entry, store and history stay put, so resume is instant
+    # and the audit trail stays continuous.
+    last_touch: float = field(default_factory=time.monotonic)
+    suspended: bool = False
+    suspended_at: Optional[datetime] = None
+    # SHA-256 inventory taken at suspension, diffed at resume so changes made
+    # while unwatched are recorded instead of silently missing.
+    gap_state: Optional[dict] = field(default=None, repr=False)
+
+    def touch(self) -> None:
+        """Renew the lease. Called on every routed event and every prompt."""
+        self.last_touch = time.monotonic()
+
+    def idle_seconds(self) -> float:
+        return time.monotonic() - self.last_touch
+
 
 class WatchRegistry:
     """The set of currently watched projects.
@@ -81,7 +101,7 @@ class WatchRegistry:
         self,
         base_audit_dir: Path,
         make_store: Callable[[Path, str], object],
-        make_builder: Callable[[Path], object],
+        make_builder: Callable[[Path, Path], object],
     ) -> None:
         self._base = Path(base_audit_dir)
         self._make_store = make_store
@@ -120,7 +140,10 @@ class WatchRegistry:
                 project_name=project,
                 audit_dir=audit_dir,
                 store=self._make_store(audit_dir / "sentinel.db", str(path)),
-                builder=self._make_builder(audit_dir),
+                # The builder is told which tree it describes. Without it a
+                # builder reads the global watch dir and reports on whichever
+                # project happens to be primary — see ReportBuilder.
+                builder=self._make_builder(audit_dir, path),
                 _key=key,
             )
             self._entries[key] = entry
@@ -169,6 +192,27 @@ class WatchRegistry:
     def entries(self) -> List[WatchEntry]:
         with self._lock:
             return sorted(self._entries.values(), key=lambda e: str(e.path).casefold())
+
+    # ── lease ───────────────────────────────────────────────────────────────
+    def idle_entries(self, ttl_seconds: float) -> List[WatchEntry]:
+        """Active watches whose lease has expired. Suspended ones are skipped —
+        they are already down and have nothing left to expire."""
+        with self._lock:
+            return [
+                e for e in self._entries.values()
+                if not e.suspended and e.idle_seconds() > ttl_seconds
+            ]
+
+    def touch(self, path) -> Optional[WatchEntry]:
+        """Renew a lease by path. Returns the entry, or None if not watched."""
+        entry = self.get(path)
+        if entry is not None:
+            entry.touch()
+        return entry
+
+    def suspended_entries(self) -> List[WatchEntry]:
+        with self._lock:
+            return [e for e in self._entries.values() if e.suspended]
 
     def paths(self) -> List[str]:
         return [str(e.path) for e in self.entries()]
