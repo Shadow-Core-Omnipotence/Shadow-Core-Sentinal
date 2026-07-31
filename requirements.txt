@@ -1,0 +1,19 @@
+# Shadow-Core Sentinel — runtime dependencies.
+#
+# This file was EMPTY until 2026-07-31, so the real dependency set existed only
+# inside .venv311 and whatever PyInstaller happened to discover by static
+# analysis. That is how chromadb and sentence-transformers ended up in the
+# 249 MB bundle: ambient_notifier imported them inside functions, PyInstaller
+# found some of it, and the frozen exe then failed 95,928 times on
+# `No module named 'chromadb.api.rust'` because the rest was missing.
+#
+# ambient_notifier has since been removed (it was a DayDream bridge, not a
+# Sentinel feature), and with it those dependencies.
+#
+# Pinned to what is installed and verified working.
+fastmcp==3.2.4
+mcp==1.27.0
+watchdog==6.0.0
+uvicorn==0.46.0
+starlette==1.0.0
+anyio==4.13.0

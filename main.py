@@ -36,14 +36,12 @@ from observer import AuditEventHandler, add_watch, remove_watch, start_bare_obse
 from watch_registry import WatchRegistry
 from report_builder import ReportBuilder
 from storage import EventStore
-from ambient_notifier import AmbientNotifier
 
 
 # TASK-S12 — Single mutable state object. Replaces the _ref = [obj] pattern.
 @dataclass
 class SentinelState:
     handler: AuditEventHandler
-    notifier: AmbientNotifier
     registry: Any = None          # WatchRegistry — the watched projects
     observer: Any = None          # set after the observer starts
     # The project that read-side callers mean when they do not name one. Every
@@ -131,7 +129,6 @@ def main():
 
     state = SentinelState(
         handler=AuditEventHandler(),
-        notifier=AmbientNotifier(str(settings.watch_dir)),
         registry=registry,
         primary=None,          # nothing watched until asked — see below
     )
@@ -151,7 +148,6 @@ def main():
         entry.builder.append_event(event)
 
     state.handler.subscribe(_record)
-    state.handler.subscribe(state.notifier.on_event)
 
     # IDLE ON BOOT. Sentinel starts with the PC and watches NOTHING until a
     # session calls watch_project.
@@ -170,7 +166,6 @@ def main():
         "File observer started — IDLE, watching nothing. "
         "Call the watch_project tool to begin monitoring a directory."
     )
-    logger.info("AmbientNotifier active — signals → %s", Path.home() / ".shadow_core" / "projects")
 
     if settings.dashboard_enabled:
 
@@ -299,14 +294,10 @@ def main():
     @mcp_server.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> JSONResponse:
         observer_alive = bool(state.observer and state.observer.is_alive())
-        ambient_state_name = state.notifier.state.name.lower() if hasattr(state.notifier, "state") else "unknown"
-        recovery_active = getattr(state.notifier, "_recovery_active", False)
         return JSONResponse({
             "sentinel": "ok",
             "version": settings.mcp_server_version,
             "observer": "ok" if observer_alive else "down",
-            "ambient": ambient_state_name,
-            "ambient_recovery_active": recovery_active,
             "dashboard": "ok" if settings.dashboard_enabled else "disabled",
             "watch_dir": str(state.primary),
             "watching": state.registry.paths(),
@@ -331,7 +322,6 @@ def main():
                     state.observer.stop()
                     state.observer.join(timeout=2.0)
                 state.handler.shutdown()
-                state.notifier.shutdown()
                 state.registry.close_all()
                 logger.info("Sentinel shut down via /admin/shutdown.")
             except Exception as e:
@@ -352,7 +342,6 @@ def main():
             state.observer.stop()
             state.observer.join()
         state.handler.shutdown()
-        state.notifier.shutdown()
         state.registry.close_all()
         logger.info("Sentinel shut down cleanly.")
 

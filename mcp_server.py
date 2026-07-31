@@ -195,7 +195,6 @@ def build_mcp_server(state) -> FastMCP:
             "primary_watch": str(state.primary) if state.primary else None,
             "total_events": state.store.total_count() if state.store else 0,
             "observer_alive": state.observer.is_alive() if hasattr(state.observer, "is_alive") else "unknown",
-            "ambient_state": state.notifier.state.name.lower() if hasattr(state.notifier, "state") else "unknown",
         }
 
     @mcp.tool()
