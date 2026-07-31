@@ -244,3 +244,16 @@ def test_watching_can_resume_after_going_idle(registry, projects):
     entry = registry.add(b)
     assert len(registry) == 1
     assert registry.route(b / "x.py") is entry
+
+
+# ── ignore patterns: found by watching a real project ────────────────────────
+def test_virtualenv_directories_are_ignored():
+    """Measured 2026-07-31: watching Scriptweaver recorded python.exe,
+    pyvenv.cfg and distutils-precedence.pth as project activity, because the
+    ignore list had `.venv` but not plain `venv` -- and that project keeps its
+    interpreter at backend/venv. 1.3 GB of virtualenv churn drowns the signal.
+    """
+    from config import settings
+    for name in ("venv", ".venv", ".venv311", "env", "site-packages",
+                 "node_modules", "__pycache__"):
+        assert name in settings.ignore_patterns, f"{name} should be ignored"

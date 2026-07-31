@@ -37,7 +37,13 @@ class Settings:
 
     ignore_patterns: List[str] = field(
         default_factory=lambda: [
-            "node_modules", ".git", ".venv", ".venv311", "__pycache__",
+            # NOTE: plain "venv" as well as ".venv". Measured 2026-07-31 while
+            # watching a real project: Scriptweaver keeps its interpreter at
+            # backend/venv (no dot), so python.exe, pyvenv.cfg and
+            # distutils-precedence.pth were being recorded as project activity.
+            # 1.3 GB of virtualenv churn drowns the signal the trail exists for.
+            "node_modules", ".git", ".venv", ".venv311", "venv", "env",
+            "__pycache__", "site-packages",
             "*.tmp", ".DS_Store", "target", "dist", "build",
             "*.pyc", "*.pyo", ".mypy_cache", ".pytest_cache",
             "sentinel.db", "sentinel.db-journal",
