@@ -124,8 +124,12 @@ def build_mcp_server(state) -> FastMCP:
         """Return the Sentinel's current operational status."""
         return {
             "status": "ok",
-            "watch_paths": settings.watch_paths if hasattr(settings, "watch_paths") else [],
-            "total_events": state.store.total_count(),
+            # Was `settings.watch_paths if hasattr(...) else []` — config only
+            # ever had `watch_dir`, singular, so this always reported an empty
+            # list. Someone had anticipated multi-watch; now it exists.
+            "watch_paths": state.registry.paths() if state.registry else [],
+            "primary_watch": str(state.primary) if state.primary else None,
+            "total_events": state.store.total_count() if state.store else 0,
             "observer_alive": state.observer.is_alive() if hasattr(state.observer, "is_alive") else "unknown",
             "ambient_state": state.notifier.state.name.lower() if hasattr(state.notifier, "state") else "unknown",
         }
@@ -153,5 +157,116 @@ def build_mcp_server(state) -> FastMCP:
             "diff": diff,
         }
 
-    logger.info("Sentinel FastMCP server configured — 6 tools registered (5 + sentinel_status with ambient_state)")
+    # ── Watch control ──────────────────────────────────────────────────────
+    # An MCP server has no idea what directory its client is working in, so an
+    # assistant has to say so explicitly. Without these there was no way to
+    # point Sentinel at anything from a session at all — watching could only be
+    # changed from the dashboard.
+
+    @mcp.tool()
+    async def watch_project(path: str) -> Dict:
+        """Start recording filesystem changes for a project directory.
+
+        Call this once at the start of a session, with the absolute path of the
+        directory being worked in. Sentinel then records every create, modify,
+        delete and move under it, with a SHA-256 of each file, so later changes
+        can be confirmed against what actually happened on disk rather than
+        what was assumed.
+
+        Additive and safe to repeat: other projects already being watched are
+        NOT affected, and re-calling it for a directory already watched is a
+        no-op. Several sessions can each watch their own project at once.
+
+        Args:
+            path: Absolute path of the project directory to watch.
+        """
+        from pathlib import Path as _Path
+
+        if not path:
+            return {"status": "error", "message": "No path provided"}
+        p = _Path(path).expanduser()
+        try:
+            p = p.resolve()
+        except OSError as exc:
+            return {"status": "error", "message": f"Bad path: {exc}"}
+        if not p.is_dir():
+            return {"status": "error", "message": f"Not a directory: {p}"}
+
+        already = state.registry.get(p) is not None
+        entry = state.registry.add(p)
+        if not already:
+            from observer import add_watch
+            entry.handle = add_watch(state.observer, state.handler, entry.path)
+
+        return {
+            "status": "ok",
+            "already_watching": already,
+            "path": str(entry.path),
+            "project_name": entry.project_name,
+            "watching": state.registry.paths(),
+        }
+
+    @mcp.tool()
+    async def unwatch_project(path: str) -> Dict:
+        """Stop recording changes for a project directory.
+
+        Only call this when explicitly asked to. Another session may be relying
+        on this watch, and stopping it silently would leave that session
+        confirming its work against a directory nobody is recording. Watches
+        cost very little to leave running.
+
+        Refuses to remove the last remaining watch, which would leave Sentinel
+        recording nothing at all.
+
+        Args:
+            path: Absolute path of the project directory to stop watching.
+        """
+        from pathlib import Path as _Path
+
+        if not path:
+            return {"status": "error", "message": "No path provided"}
+        p = _Path(path).expanduser().resolve()
+
+        entry = state.registry.get(p)
+        if entry is None:
+            return {"status": "error", "message": f"Not being watched: {p}"}
+        if len(state.registry) == 1:
+            return {
+                "status": "error",
+                "message": "Refusing to unwatch the only project — Sentinel "
+                           "would be recording nothing.",
+            }
+
+        from observer import remove_watch
+        remove_watch(state.observer, entry.handle)
+        state.registry.remove(p)
+        if state.primary == entry.path:
+            state.primary = state.registry.entries()[0].path
+
+        return {"status": "ok", "unwatched": str(p), "watching": state.registry.paths()}
+
+    @mcp.tool()
+    async def list_watched_projects() -> Dict:
+        """List every project directory Sentinel is currently recording.
+
+        Use this to check whether the directory being worked in is actually
+        being watched before relying on Sentinel to confirm a change. A project
+        that is not listed has no audit trail being written for it.
+        """
+        return {
+            "status": "ok",
+            "count": len(state.registry),
+            "primary": str(state.primary),
+            "projects": [
+                {
+                    "path": str(e.path),
+                    "project_name": e.project_name,
+                    "audit_dir": str(e.audit_dir),
+                }
+                for e in state.registry.entries()
+            ],
+        }
+
+    logger.info("Sentinel FastMCP server configured — 9 tools registered "
+                "(6 read + watch_project/unwatch_project/list_watched_projects)")
     return mcp

@@ -171,3 +171,36 @@ def start_observer(handler: AuditEventHandler) -> Observer:
     handler._watch = obs.schedule(handler, str(settings.watch_dir), recursive=settings.recursive)
     obs.start()
     return obs
+
+
+def start_bare_observer() -> Observer:
+    """A running observer with NO watches scheduled yet.
+
+    Multi-watch startup schedules each project through add_watch() instead of
+    baking one path in at construction, so the first watch is not special.
+    """
+    obs = Observer()
+    obs.start()
+    return obs
+
+
+def add_watch(observer: Observer, handler: AuditEventHandler, path) -> object:
+    """Schedule one more directory. Returns the handle needed to remove it.
+
+    Additive: watchdog keeps every existing watch. The handle matters because
+    removal must be precise — `unschedule_all()` would take down every other
+    session's project along with this one.
+    """
+    return observer.schedule(handler, str(path), recursive=settings.recursive)
+
+
+def remove_watch(observer: Observer, handle) -> bool:
+    """Unschedule exactly one watch. False if it was already gone."""
+    if handle is None:
+        return False
+    try:
+        observer.unschedule(handle)
+        return True
+    except Exception as exc:  # noqa: BLE001 — already-removed is not an error
+        logger.debug("unschedule failed (likely already removed): %s", exc)
+        return False

@@ -32,7 +32,8 @@ from starlette.responses import JSONResponse
 from config import settings
 from dashboard import start_dashboard
 from mcp_server import build_mcp_server
-from observer import AuditEventHandler, start_observer
+from observer import AuditEventHandler, add_watch, remove_watch, start_bare_observer
+from watch_registry import WatchRegistry
 from report_builder import ReportBuilder
 from storage import EventStore
 from ambient_notifier import AmbientNotifier
@@ -41,11 +42,26 @@ from ambient_notifier import AmbientNotifier
 # TASK-S12 — Single mutable state object. Replaces the _ref = [obj] pattern.
 @dataclass
 class SentinelState:
-    store: EventStore
-    builder: ReportBuilder
     handler: AuditEventHandler
     notifier: AmbientNotifier
-    observer: Any = None  # set after start_observer()
+    registry: Any = None          # WatchRegistry — the watched projects
+    observer: Any = None          # set after the observer starts
+    # The project that read-side callers mean when they do not name one. Every
+    # project is watched simultaneously; this only decides the default view.
+    primary: Any = None           # Path
+
+    # `store` and `builder` used to be plain fields swapped by pivot_room. They
+    # now resolve through the registry so the dashboard, the MCP tools and the
+    # /health route keep working unchanged while several projects are watched.
+    @property
+    def store(self):
+        entry = self.registry.get(self.primary) if self.registry else None
+        return entry.store if entry else None
+
+    @property
+    def builder(self):
+        entry = self.registry.get(self.primary) if self.registry else None
+        return entry.builder if entry else None
 
 
 def parse_args():
@@ -99,19 +115,40 @@ def main():
 
     # TASK-S12 — Build state object; closures and tools reference state.* so
     # pivots/rollbacks that swap fields are visible everywhere.
-    state = SentinelState(
-        store=EventStore(settings.db_path, str(settings.watch_dir)),
-        builder=ReportBuilder(settings.audit_dir),
-        handler=AuditEventHandler(),
-        notifier=AmbientNotifier(str(settings.watch_dir)),
+    registry = WatchRegistry(
+        base_audit_dir=settings.base_audit_dir,
+        make_store=EventStore,
+        make_builder=ReportBuilder,
     )
 
-    state.handler.subscribe(lambda e: state.store.insert(e))
-    state.handler.subscribe(lambda e: state.builder.append_event(e))
+    state = SentinelState(
+        handler=AuditEventHandler(),
+        notifier=AmbientNotifier(str(settings.watch_dir)),
+        registry=registry,
+        primary=Path(settings.watch_dir).resolve(),
+    )
+
+    # Every event is ROUTED to the project that owns its path, rather than
+    # going to one global store. With several watches, an event filed under the
+    # wrong project silently corrupts that project's audit trail — which is the
+    # one thing this service exists to be trusted about.
+    def _record(event) -> None:
+        entry = state.registry.route(event.src_path)
+        if entry is None:
+            # Outside every watch. Reachable when a watch is removed while its
+            # events are still in flight through the hashing pool.
+            logger.debug("Event outside all watches, dropped: %s", event.src_path)
+            return
+        entry.store.insert(event)
+        entry.builder.append_event(event)
+
+    state.handler.subscribe(_record)
     state.handler.subscribe(state.notifier.on_event)
 
-    state.observer = start_observer(state.handler)
-    logger.info("File observer started")
+    state.observer = start_bare_observer()
+    _entry = state.registry.add(state.primary)
+    _entry.handle = add_watch(state.observer, state.handler, _entry.path)
+    logger.info("File observer started — watching %s", _entry.path)
     logger.info("AmbientNotifier active — signals → %s", Path.home() / ".shadow_core" / "projects")
 
     if settings.dashboard_enabled:
@@ -120,11 +157,12 @@ def main():
             mem = state.handler.recent_events(settings.max_memory_events)
             alerts = state.handler.recent_alerts()
             return {
-                "watch_dir": str(settings.watch_dir),
+                "watch_dir": str(state.primary),
+                "watching": state.registry.paths(),
                 "project_name": settings.project_name,
                 "audit_dir": str(settings.audit_dir),
                 "version": settings.mcp_server_version,
-                "total_db_events": state.store.total_count(),
+                "total_db_events": state.store.total_count() if state.store else 0,
                 "memory_events": len(mem),
                 "recent_alerts": len(alerts),
                 "alerts_detail": alerts,
@@ -150,53 +188,35 @@ def main():
                     if not a.name.startswith("audit-")]
 
         def do_pivot(path_str: str) -> dict:
+            """Watch another project. ADDITIVE — nothing is unwatched.
+
+            This used to call observer.unschedule_all() and swap the single
+            store. That silently stopped every other session's monitoring: the
+            other session kept confirming its changes against a directory
+            Sentinel was no longer looking at. Pivot now means "also watch
+            this, and make it the default view".
+            """
             if not path_str:
                 return {"status": "error", "message": "No path provided"}
             p = Path(path_str).resolve()
             if not p.exists() or not p.is_dir():
                 return {"status": "error", "message": f"Not a directory: {path_str}"}
             try:
-                # Pivot observer
-                state.observer.unschedule_all()
-                settings.update_watch_dir(p)
-                state.handler._watch = state.observer.schedule(
-                    state.handler, str(p), recursive=settings.recursive)
+                entry = state.registry.get(p)
+                if entry is None:
+                    entry = state.registry.add(p)
+                    entry.handle = add_watch(state.observer, state.handler, entry.path)
+                    logger.info("Now also watching %s (project=%s)", p, entry.project_name)
 
-                # Swap store to new project DB
-                old_store = state.store
-                state.store = EventStore(settings.db_path, str(p))
-                old_store.close()
+                state.primary = entry.path
+                settings.update_watch_dir(p)   # keeps derived config in step
 
-                # Swap builder to new project audit dir
-                state.builder = ReportBuilder(settings.audit_dir)
-                state.store.set_watch_path(str(p))
-
-                logger.info(f"Pivoted to project: {settings.project_name} → {p}")
                 return {
                     "status": "ok",
                     "new_watch_path": str(p),
-                    "project_name": settings.project_name,
-                    "audit_dir": str(settings.audit_dir),
-                }
-            except Exception as e:
-                return {"status": "error", "message": str(e)}
-
-        def do_rollback() -> dict:
-            prev = settings.rollback_watch_dir()
-            if prev is None:
-                return {"status": "error", "message": "No previous path"}
-            try:
-                state.observer.unschedule_all()
-                state.handler._watch = state.observer.schedule(
-                    state.handler, str(prev), recursive=settings.recursive)
-                old_store = state.store
-                state.store = EventStore(settings.db_path, str(prev))
-                old_store.close()
-                state.builder = ReportBuilder(settings.audit_dir)
-                return {
-                    "status": "ok",
-                    "restored_path": str(prev),
-                    "project_name": settings.project_name,
+                    "project_name": entry.project_name,
+                    "audit_dir": str(entry.audit_dir),
+                    "watching": state.registry.paths(),
                 }
             except Exception as e:
                 return {"status": "error", "message": str(e)}
@@ -237,8 +257,10 @@ def main():
             "ambient": ambient_state_name,
             "ambient_recovery_active": recovery_active,
             "dashboard": "ok" if settings.dashboard_enabled else "disabled",
-            "watch_dir": str(settings.watch_dir),
-            "total_events": state.store.total_count(),
+            "watch_dir": str(state.primary),
+            "watching": state.registry.paths(),
+            "watch_count": len(state.registry),
+            "total_events": state.store.total_count() if state.store else 0,
             "as_of": datetime.now(timezone.utc).isoformat(),
         })
 
@@ -259,7 +281,7 @@ def main():
                     state.observer.join(timeout=2.0)
                 state.handler.shutdown()
                 state.notifier.shutdown()
-                state.store.close()
+                state.registry.close_all()
                 logger.info("Sentinel shut down via /admin/shutdown.")
             except Exception as e:
                 logger.warning(f"Shutdown cleanup error: {e}")
@@ -280,7 +302,7 @@ def main():
             state.observer.join()
         state.handler.shutdown()
         state.notifier.shutdown()
-        state.store.close()
+        state.registry.close_all()
         logger.info("Sentinel shut down cleanly.")
 
 
