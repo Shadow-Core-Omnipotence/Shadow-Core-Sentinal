@@ -104,18 +104,82 @@ def build_mcp_server(state) -> FastMCP:
         return await get_daily_report(today)
 
     @mcp.tool()
-    async def query_events(date_key: str) -> Dict:
+    async def recent_changes(minutes: int = 15, limit: int = 100,
+                             include_hashes: bool = False) -> Dict:
+        """What actually changed on disk in the last N minutes. START HERE.
+
+        This is the tool for confirming work: after editing files, call it to
+        see what the filesystem really recorded, rather than trusting that an
+        edit did what was intended. Comparing "files I meant to touch" against
+        this catches both missed edits and unintended ones.
+
+        Prefer this over query_events. query_events takes a whole DATE, which
+        on a busy project is tens of thousands of rows (measured: 19,936 in one
+        day) — far too many to read and not an answer to "did my change land?".
+        A task-sized window is usually tens of rows.
+
+        Hashes are omitted by default: the kind and path already say what
+        changed, and a SHA is 64 characters per row. Ask for them only when
+        verifying content identity.
+
+        Args:
+            minutes: How far back to look. Default 15.
+            limit: Maximum rows returned. Default 100.
+            include_hashes: Include the SHA-256 of each file. Default False.
         """
-        Query raw filesystem events for a specific date.
+        from datetime import timedelta
+
+        if state.store is None:
+            return {"status": "idle",
+                    "message": "No project is being watched. Call watch_project first.",
+                    "count": 0, "events": []}
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max(1, minutes)))
+        since_iso = cutoff.isoformat()
+        total = state.store.count_since(since_iso)
+        events = state.store.query_since(since_iso, limit=limit,
+                                         include_hashes=include_hashes)
+        return {
+            "status": "ok",
+            "project": str(state.primary),
+            "window_minutes": minutes,
+            "total_in_window": total,
+            "returned": len(events),
+            "truncated": total > len(events),
+            "events": events,
+        }
+
+    @mcp.tool()
+    async def query_events(date_key: str, limit: int = 500,
+                           include_hashes: bool = False) -> Dict:
+        """Filesystem events for a whole calendar date.
+
+        Use recent_changes instead unless you specifically need a historical
+        day. A busy project records tens of thousands of events per date, so
+        this is capped by `limit` and will usually be truncated.
 
         Args:
             date_key: Date in YYYY-MM-DD format.
+            limit: Maximum rows returned. Default 500.
+            include_hashes: Include the SHA-256 of each file. Default False.
         """
+        if state.store is None:
+            return {"status": "idle",
+                    "message": "No project is being watched. Call watch_project first.",
+                    "count": 0, "events": []}
+
         events = state.store.query_by_date(date_key)
+        total = len(events)
+        events = events[:max(1, limit)]
+        if not include_hashes:
+            for e in events:
+                e.pop("sha256", None)
         return {
             "status": "ok",
             "date": date_key,
-            "count": len(events),
+            "total_on_date": total,
+            "returned": len(events),
+            "truncated": total > len(events),
             "events": events,
         }
 

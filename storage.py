@@ -91,6 +91,50 @@ class EventStore:
                 for r in cur.fetchall()
             ]
 
+    def query_since(self, since_iso: str, limit: int = 200,
+                    include_hashes: bool = True) -> List[dict]:
+        """Events newer than `since_iso`, newest first.
+
+        WHY THIS EXISTS: query_by_date returns a whole DAY. On a busy project
+        that is ~20,000 rows for a single date — measured 19,936 on 2026-06-02
+        — which is unusable as an answer to "did my edit land?". A task-sized
+        window is tens of rows, not tens of thousands.
+
+        Timestamps are stored as `datetime.isoformat()`, which sorts
+        lexicographically PROVIDED every row shares an offset. They do: events
+        are written with UTC timestamps. A plain string comparison is therefore
+        both correct and index-friendly here.
+
+        `include_hashes=False` drops the SHA from the response. It is 64 chars
+        per row and is rarely needed to answer "what changed" — the kind and
+        path already say that. It stays in the DATABASE either way; this only
+        controls what is handed back.
+        """
+        cols = "ts, kind, src_path, dest_path, watch_path"
+        with self._lock:
+            cur = self._conn.execute(
+                f"SELECT {cols}, sha256 FROM events "
+                "WHERE ts > ? ORDER BY id DESC LIMIT ?",
+                (since_iso, int(limit)),
+            )
+            out = []
+            for r in cur.fetchall():
+                row = {
+                    "ts": r[0], "kind": r[1], "src_path": r[2],
+                    "dest_path": r[3], "watch_path": r[4],
+                }
+                if include_hashes:
+                    row["sha256"] = r[5]
+                out.append(row)
+            return out
+
+    def count_since(self, since_iso: str) -> int:
+        """How many events since `since_iso` — the cheap question to ask first."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT COUNT(*) FROM events WHERE ts > ?", (since_iso,))
+            return cur.fetchone()[0]
+
     def total_count(self) -> int:
         with self._lock:
             cur = self._conn.execute("SELECT COUNT(*) FROM events")

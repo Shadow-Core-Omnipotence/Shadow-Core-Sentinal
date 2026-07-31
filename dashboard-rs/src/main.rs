@@ -253,6 +253,13 @@ async fn stats(State(st): State<AppState>) -> Response {
 struct EventQuery {
     project: Option<String>,
     limit: Option<usize>,
+    /// ISO-8601 lower bound. Without it the only way to narrow a query was by
+    /// whole calendar day, which on a busy project is ~20,000 rows (measured:
+    /// 19,936 on 2026-06-02) — no use for answering "did my change land?".
+    since: Option<String>,
+    /// Hashes are 64 chars per row and are rarely needed to see WHAT changed.
+    /// Omitted unless asked for; they remain in the database regardless.
+    hashes: Option<bool>,
 }
 
 async fn events(State(st): State<AppState>, Query(q): Query<EventQuery>) -> Response {
@@ -286,10 +293,22 @@ async fn events(State(st): State<AppState>, Query(q): Query<EventQuery>) -> Resp
     } else {
         "NULL"
     };
-    let sql = format!(
-        "SELECT ts, kind, src_path, dest_path, sha256, {watch_col} \
-         FROM events ORDER BY id DESC LIMIT ?1"
-    );
+
+    // Timestamps are written by Python's datetime.isoformat() in UTC, so they
+    // sort lexicographically and a string comparison is both correct and
+    // index-friendly.
+    let filtered = q.since.is_some();
+    let sql = if filtered {
+        format!(
+            "SELECT ts, kind, src_path, dest_path, sha256, {watch_col} \
+             FROM events WHERE ts > ?2 ORDER BY id DESC LIMIT ?1"
+        )
+    } else {
+        format!(
+            "SELECT ts, kind, src_path, dest_path, sha256, {watch_col} \
+             FROM events ORDER BY id DESC LIMIT ?1"
+        )
+    };
 
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -302,21 +321,36 @@ async fn events(State(st): State<AppState>, Query(q): Query<EventQuery>) -> Resp
         }
     };
 
-    let rows = stmt
-        .query_map([limit], |r| {
-            Ok(Event {
-                ts: r.get(0)?,
-                kind: r.get(1)?,
-                src_path: r.get(2)?,
-                dest_path: r.get(3)?,
-                sha256: r.get(4)?,
-                watch_path: r.get(5)?,
-            })
+    let want_hashes = q.hashes.unwrap_or(false);
+    let map_row = |r: &rusqlite::Row| -> rusqlite::Result<Event> {
+        Ok(Event {
+            ts: r.get(0)?,
+            kind: r.get(1)?,
+            src_path: r.get(2)?,
+            dest_path: r.get(3)?,
+            sha256: if want_hashes { r.get(4)? } else { None },
+            watch_path: r.get(5)?,
         })
-        .and_then(|m| m.collect::<Result<Vec<_>, _>>())
-        .unwrap_or_default();
+    };
 
-    Json(json!({ "project": project, "count": rows.len(), "events": rows })).into_response()
+    let rows = if let Some(ref since) = q.since {
+        stmt.query_map(rusqlite::params![limit, since], map_row)
+            .and_then(|m| m.collect::<Result<Vec<_>, _>>())
+            .unwrap_or_default()
+    } else {
+        stmt.query_map(rusqlite::params![limit], map_row)
+            .and_then(|m| m.collect::<Result<Vec<_>, _>>())
+            .unwrap_or_default()
+    };
+
+    Json(json!({
+        "project": project,
+        "count": rows.len(),
+        "since": q.since,
+        "hashes_included": want_hashes,
+        "events": rows,
+    }))
+    .into_response()
 }
 
 async fn snapshots(State(st): State<AppState>, Query(q): Query<EventQuery>) -> Response {
