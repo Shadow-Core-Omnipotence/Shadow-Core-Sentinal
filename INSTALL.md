@@ -10,24 +10,42 @@ step lived only in undocumented machine state. These scripts are it.
 
 ---
 
-## ⚠ If you are on the original Shadow-Core machine, read this first
+## Where startup lives
 
-Sentinel is **already started at logon there**, but not by anything in this
-repository. A scheduled task named **"Shadow Core MCP Servers"** runs:
+**Sentinel starts itself, from this repository.** `install.ps1` registers a
+logon task named **"Shadow-Core Sentinel"** that runs `dist\shadow-core-sentinel.exe`
+from this directory. That is the whole mechanism, and it is version-controlled
+alongside the code it starts.
+
+It did not used to be. Until 2026-08-05 Sentinel was launched by a scheduled
+task named "Shadow Core MCP Servers" running
+`E:\AI Backup Projects\start-shadow-core-mcp.ps1`, a seven-server orchestrator
+living outside any repository — so the startup path and the code it started could
+drift apart, and did: the script passed `--mcp-port` to an exe too old to accept
+the flag, and Sentinel silently failed to start.
+
+Sentinel has been removed from that script's server list. **Do not add it back**
+while the logon task exists, or two tasks will race for port 7702 and the loser
+will exit, leaving a task that looks installed while nothing new is running.
+
+<details>
+<summary>The old shared orchestrator (still starts six other servers)</summary>
 
 ```
 E:\AI Backup Projects\start-shadow-core-mcp.ps1
 ```
 
-That script is a multi-server orchestrator outside this repo. It launches seven
-Shadow-Core servers — memory, sentinel, telemetry, engineer, knowledge,
-daydream, ambient — sets shared environment variables (`AUDIT_DIR`, `MCP_PORT`,
-`DASHBOARD_PORT`, …), and starts each exe hidden, skipping any that is already
-running. Sentinel is launched from `dist\shadow-core-sentinel.exe` **with no
-arguments**, so it takes its configuration entirely from those environment
-variables.
+A multi-server orchestrator outside any repository. It still starts six servers
+— memory, telemetry, engineer, knowledge, daydream, ambient — hidden, skipping
+any already running.
 
-Its Sentinel wiring was reviewed on 2026-08-03 and corrected:
+Worth knowing: of those six, **none is configured in `~/.claude.json`**, where
+`shadow-core-sentinel` is the only registered MCP server. They start at every
+logon and nothing connects to them.
+
+While Sentinel was still in that list its wiring was reviewed and corrected on
+2026-08-03. The fixes below stayed in the script and still apply to the
+remaining servers:
 
 - **`-Stop` now asks before killing.** It used to `Stop-Process -Force` every
   server. For Sentinel that is a force kill of an audit tool with events in
