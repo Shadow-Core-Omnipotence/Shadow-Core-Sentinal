@@ -1,18 +1,40 @@
 """
 dashboard.py — Shadow-Core Sentinel Mission Control Dashboard v1.2.0
 Serves a developer-facing HTML dashboard and JSON API.
+
+THE dashboard. There was a second implementation in `dashboard-rs/` — an axum
+service reading the audit databases read-only in its own process — written on
+the premise (TECH_DEBT_AUDIT.md #4) that this one's daemon thread kept the
+process alive after the main thread died, so a dead server looked healthy.
+
+That premise is false. The serving thread is created with `daemon=True`, and a
+daemon thread does not keep the interpreter alive; verified by execution, a
+process whose main thread exits with code 3 while a daemon thread loops does
+exit, immediately, with code 3. Nothing was being masked, so the rewrite bought
+a duplicated read model, a second dependency tree, and a Rust plus C toolchain
+in the install path for a problem that did not exist. It has been deleted; this
+is the only dashboard.
+
+Liveness is answered by `/health` on the MCP port, which is the right place for
+it — that port is the one a client actually depends on.
 """
 
 import json
 import logging
 import threading
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
-from typing import Callable, List
+from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
+
+# The only POST bodies are a path, a label or an ignore pattern. A ceiling means
+# a bad or hostile Content-Length cannot make the handler allocate arbitrarily.
+_MAX_BODY_BYTES = 64 * 1024
+# How much of an over-long body is read and discarded before answering 413.
+# Enough that an ordinary mistake gets its error message; bounded so a hostile
+# Content-Length cannot hold the handler open indefinitely.
+_MAX_DRAIN_BYTES = 8 * 1024 * 1024
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -650,7 +672,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="stat-card yellow">
       <div class="stat-label">Active Alerts</div>
       <div class="stat-value" id="stat-alerts">—</div>
-      <div class="stat-sub">rate threshold breaches</div>
+      <div class="stat-sub scope-note">global — all projects</div>
     </div>
     <div class="stat-card red">
       <div class="stat-label">Ignore Patterns</div>
@@ -701,7 +723,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <!-- Alerts -->
       <div class="panel">
         <div class="panel-header">
-          <span class="panel-title">Alerts</span>
+          <!-- Rate alerts fire before an event is routed to a project, so they
+               describe the whole process. Said here because the panel sits
+               inside a project's tab alongside genuinely scoped numbers. -->
+          <span class="panel-title">Alerts <span class="scope-note">· all projects</span></span>
           <span class="panel-badge" id="alert-badge">0</span>
         </div>
         <div id="alerts-container">
@@ -1038,12 +1063,42 @@ def _make_handler(get_stats: Callable[..., dict], get_events: Callable[..., list
             elif p == '/api/projects':
                 self._json(get_projects())
             else:
-                self.send_response(404); self.end_headers()
+                self._json_error('Not found', status=404)
 
         def do_POST(self):
             p = urlparse(self.path).path
-            length = int(self.headers.get('Content-Length', 0))
-            body = json.loads(self.rfile.read(length) or '{}')
+
+            # Parsed BEFORE any route dispatch, so a malformed body used to
+            # raise JSONDecodeError inside the handler and BaseHTTPRequestHandler
+            # dropped the connection with no response at all — the caller saw a
+            # reset socket rather than a reason. `/api/touch` in main.py already
+            # answers this case with an explicit 400; this now matches it.
+            try:
+                length = int(self.headers.get('Content-Length', 0) or 0)
+            except ValueError:
+                return self._json_error('Bad Content-Length header')
+            if length < 0 or length > _MAX_BODY_BYTES:
+                # DRAIN before answering. Replying while the client is still
+                # writing resets the connection, and the caller then sees a
+                # ConnectionAborted instead of the 413 explaining what was
+                # wrong — the same "no answer" failure this guard exists to
+                # remove. Discarded in chunks, so an absurd Content-Length
+                # costs bounded memory and a bounded read, not either extreme.
+                self._drain(length)
+                return self._json_error(
+                    f'Body too large (limit {_MAX_BODY_BYTES} bytes)', status=413)
+            try:
+                raw = self.rfile.read(length) if length else b''
+                body = json.loads(raw or b'{}')
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                return self._json_error(f'Malformed JSON body: {exc}')
+            except OSError as exc:
+                return self._json_error(f'Could not read request body: {exc}')
+            if not isinstance(body, dict):
+                # A bare list or string parses fine but has no `.get`, which
+                # would fail one line later with the same silent drop.
+                return self._json_error('Body must be a JSON object')
+
             if p == '/api/pivot':
                 self._json(do_pivot(body.get('path', '')))
             elif p == '/api/rollback':
@@ -1055,11 +1110,27 @@ def _make_handler(get_stats: Callable[..., dict], get_events: Callable[..., list
             elif p == '/api/ignore':
                 self._json(do_ignore(body.get('pattern', '')))
             else:
-                self.send_response(404); self.end_headers()
+                self._json_error('Not found', status=404)
 
-        def _json(self, data):
+        def _drain(self, length: int) -> None:
+            """Read and discard an over-long body, up to a hard ceiling."""
+            remaining = min(length, _MAX_DRAIN_BYTES)
+            try:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+            except OSError:
+                pass  # client gave up first; the 413 attempt is still worth making
+
+        def _json_error(self, message: str, status: int = 400):
+            """An explicit refusal beats a dropped connection."""
+            self._json({'status': 'error', 'message': message}, status=status)
+
+        def _json(self, data, status: int = 200):
             body = json.dumps(data, default=str).encode()
-            self.send_response(200)
+            self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body)))
             self.send_header('Access-Control-Allow-Origin', '*')
@@ -1078,15 +1149,22 @@ def _make_handler(get_stats: Callable[..., dict], get_events: Callable[..., list
 
 
 def start_dashboard(port: int, get_stats, get_events, get_snapshots, get_projects,
-                    do_pivot, do_rollback, do_audit, do_ignore) -> threading.Thread:
+                    do_pivot, do_rollback, do_audit, do_ignore) -> HTTPServer:
+    """Serve the dashboard on a daemon thread.
+
+    Returns the SERVER, not the thread. Nothing used the thread, and the server
+    is what a caller actually needs: `server_address` to learn the bound port
+    (so a test can ask for port 0 and be told what it got) and `shutdown()` to
+    stop it. Loopback-only — this exposes a filesystem audit trail.
+    """
     handler = _make_handler(get_stats, get_events, get_snapshots, get_projects,
                             do_pivot, do_rollback, do_audit, do_ignore)
     server = HTTPServer(('127.0.0.1', port), handler)
+    bound = server.server_address[1]
 
     def run():
-        logger.info(f"Dashboard → http://127.0.0.1:{port}")
+        logger.info(f"Dashboard → http://127.0.0.1:{bound}")
         server.serve_forever()
 
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    return t
+    threading.Thread(target=run, daemon=True, name="dashboard").start()
+    return server
