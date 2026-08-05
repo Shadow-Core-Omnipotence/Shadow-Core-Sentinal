@@ -10,7 +10,15 @@
 # ambient_notifier has since been removed (it was a DayDream bridge, not a
 # Sentinel feature), and with it those dependencies.
 #
-# Pinned to what is installed and verified working.
+# Pinned to what is installed and verified working, on PYTHON 3.11.
+#
+# This file is the RUNTIME set only, and is what the PyInstaller build resolves
+# against. Test and lint tools live in pyproject.toml under [dev] — they were
+# previously declared nowhere at all, so a clean checkout following the README
+# could not run the suite that pytest.ini and all the test files require.
+#
+#   runtime only :  pip install -r requirements.txt
+#   development  :  pip install -e ".[dev]"
 fastmcp==3.2.4
 mcp==1.27.0
 watchdog==6.0.0

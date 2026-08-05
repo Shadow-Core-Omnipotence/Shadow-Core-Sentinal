@@ -1,212 +1,109 @@
 # Shadow-Core Sentinel — Technical Debt Audit
 
-**Audit date:** 2026-05-17
-**Auditor:** Claude (post-SSE migration session)
-**Repo root:** `E:\AI Backup Projects\Shadow-Core Sentinel\`
-**Status at audit:** SSE rebuild verified building successfully; port-binding (7702) verification cut off before completion.
+**Last audit:** 2026-08-03
+**Previous audit:** 2026-05-17 (superseded — see *History* below)
 
 ---
 
-## Executive Summary
+## Status
 
-Sentinel is functional but carries notable architectural debt accumulated during the rapid stdio → SSE transport migration. The most severe issue (a FastMCP/raw-Server API mismatch causing silent port-bind failure) was fixed this session, but a cluster of related smells around the mixed `fastmcp` + `mcp.server` package usage, dual virtualenvs, and silent-failure modes will keep biting until addressed.
-
-**Risk level: MEDIUM.** Single-process server, all data is reproducible from the watched filesystem, but observability is poor and several failure modes produce no diagnostic output.
-
----
-
-## Critical Issues Found This Session
-
-### 1. FastMCP / raw-Server API mismatch (FIXED, verify after restart)
-
-**Location:** `mcp_server.py:147` and `main.py:189-196`
-
-**Problem:** `build_mcp_server()` returned a `fastmcp.FastMCP` instance, but `main.py`'s SSE handler invoked it as if it were a raw `mcp.server.lowlevel.Server`:
-
-```python
-async with _sse.connect_sse(...) as (read_stream, write_stream):
-    await mcp_server.run(
-        read_stream, write_stream,
-        mcp_server.create_initialization_options()
-    )
-```
-
-`FastMCP.run()` signature is `(transport, show_banner, **transport_kwargs)` — passing positional read/write streams is silently incompatible. Result: server process stayed alive (the dashboard thread kept it from exiting), but no MCP port was ever bound. **Zero stderr output** — extremely hard to diagnose.
-
-**Fix applied:** `return mcp._mcp_server` (expose underlying raw `Server`) at `mcp_server.py:147`.
-
-**Verification gap:** Did not confirm port 7702 actually binds after the rebuild — cut off before the final check.
-
-**Action:** Confirm 7702 listening on first run tomorrow; if not, capture stderr via `[System.Diagnostics.Process]::Start` with `RedirectStandardError=true` rather than `Start-Process`.
+All items from the 2026-08-03 audit are resolved. The suite is 199 tests
+(`pytest -m "not slow"`), `ruff check .` is clean, and the service has been
+verified running end-to-end: `/health`, the dashboard, pivot, live event
+recording, disk snapshot, and graceful shutdown.
 
 ---
 
-## Architectural Debt
+## Resolved 2026-08-03
 
-### 2. Two different MCP libraries used in one process
+### Architectural
 
-`mcp_server.py` imports `from fastmcp import FastMCP` (standalone fastmcp package, currently 3.2.4)
-`main.py` imports `from mcp.server.sse import SseServerTransport` (MCP SDK's bundled server module)
+| # | Issue | Resolution |
+| --- | --- | --- |
+| 1 | `state.primary` was assigned only by the dashboard's pivot/rollback, never by `watch_project` — so a session driven purely over MCP left every read tool answering "no project is being watched" while recording worked. Confirmed live: 2 projects watched, `"primary": "None"`, `recent_changes` idle. | `watch_project` sets `primary`; `_primary_entry()` falls back to the sole watched project. `tests/test_primary_selection.py` |
+| 2 | `_auto_ignore_audit_dir()` appended `rel.parts[0]` — a bare directory name — to the process-global `ignore_patterns` on every `update_watch_dir`. Measured: one pivot made `is_ignored(.../Shadow-Core Sentinel/main.py)` return True, silently blinding Sentinel to its own repo and any project sharing that path component. | Deleted. Audit output is excluded by containment, which already covered every project. `tests/test_config_ignores.py` |
+| 3 | `read_snapshot`/`diff_snapshot` resolved artifacts against `settings.audit_dir` — the global that `watch_project` never updates — while the names came from the per-project builder. | `ReportBuilder.read_artifact_by_name` owns the join and refuses non-filename references. `mcp_server` no longer imports `config`. |
+| 4 | Two dashboards: `dashboard.py` (shipped) and `dashboard-rs/` (never built or launched by anything). | `dashboard-rs/` deleted. Its premise — that the daemon serving thread masked a crashed main thread — was verified false: a `daemon=True` thread does not keep the interpreter alive. |
+| 5 | `main()` was ~420 lines with ten inline closures and three route handlers, none importable or testable. | Extracted `dashboard_wiring.py` and `http_routes.py`; unified two divergent teardown paths into `_shutdown()`. `main()` is 107 lines. |
 
-These are sibling implementations of the same protocol with **divergent APIs and config models**. Our session-ending bug came directly from this split — we wrote SSE handler code against MCP SDK conventions but pointed it at a FastMCP object.
+### Code-level
 
-**Recommendation:** Pick one. Either:
-- (a) Use `fastmcp` end-to-end and call `mcp.run(transport="sse", host=..., port=...)` like Knowledge does — simpler, deletes ~30 lines of main.py
-- (b) Use `mcp.server.lowlevel.Server` directly and remove the `fastmcp` dependency
+| # | Issue | Resolution |
+| --- | --- | --- |
+| 6 | `config._safe_dir_name` and `watch_registry.safe_project_name` were byte-identical, with a comment warning that divergence would orphan every `sentinel.db`. | Single definition in `watch_registry`; `config` imports it. |
+| 7 | The ignore-pruning tree walk existed twice, with different ignore sources. | `build_disk_snapshot` calls `lease.scan_tree`. Snapshot paths are now relative, matching gap reports. |
+| 8 | Six unreachable definitions, one of which (`models.SentinelState`) shadowed the live dataclass in `main.py`. | All deleted. |
+| 9 | MCP host/port hardcoded at the call site; `--port` silently moved the *dashboard*. | `Settings.mcp_host`/`mcp_port` with env overrides; `--mcp-port`/`--mcp-host`/`--dashboard-port`, with `--port` kept as a deprecated alias. |
+| 10 | `EventStore.insert` swallowed every exception and returned None; callers treated it as success and wrote the markdown row anyway, leaving two records that disagree with no signal. | Returns bool, counts `failed_writes`, surfaced on `/health` and `sentinel_status`. |
+| 11 | One commit — one fsync — per filesystem event. | WAL + `synchronous=NORMAL`; `insert_many` for gap reconstruction, degrading to per-row on failure. |
+| 12 | Four builder-backed tools dereferenced `state.builder` unguarded and raised `AttributeError` in the normal idle state, while two others returned a clean result. | One `IDLE_RESULT`, applied uniformly. |
+| 13 | Process-wide rate alerts rendered inside a per-project tab with no label. | `alerts_scope: "process"` in the payload and "all projects" in the UI. Per-project attribution was rejected deliberately: alerting fires before routing, and moving it behind the hashing pool would delay burst detection. |
+| 14 | `do_POST` parsed the body before route dispatch with no guard; malformed JSON dropped the connection with no response. | Explicit 400/413 with a bounded drain. `tests/test_dashboard_api.py` |
+| 15 | Seven function-local imports, two of which hid a real `mcp_server` → `observer` dependency. | Hoisted to module scope. |
+| 16 | `str(state.primary)` emitted the string `"None"` for an unset primary. | `state.primary_path`, serialised as JSON null. |
 
-Option (a) is the easier path and aligns Sentinel with Knowledge.
+### Retention — added 2026-08-05
 
-### 3. Dual virtualenvs (`.venv` and `.venv311`)
+The trail had no retention policy of any kind and had reached 252 MB, 38% of it
+a dead project created by a typo in a watched path. `retention.py` now flushes
+all recorded audit data at startup (`SENTINEL_FLUSH_ON_START`, default true),
+which bounds disk to a single run. The trade is explicit and one-way:
+cross-restart forensics is gone, so `list_audit_dates`, `get_daily_report` and
+`query_events` can only answer about the current run.
 
-- `.venv` — missing uvicorn + starlette (incomplete for SSE)
-- `.venv311` — has the full stack but `Scripts\pyinstaller.exe` is **broken** (exits 1 even on `--version`)
+Deletion is guarded, because it acts on a path that comes from an environment
+variable: only directories holding a `sentinel.db` or Sentinel's own markdown
+(or empty project directories) are removed, an audit root within three path
+components of a filesystem root is refused outright, and everything else is left
+alone and logged. 24 tests, most of them proving it refuses.
 
-The rebuild script works around this with conditional logic:
-```powershell
-if ($b.Pip -like "*python.exe") { & $b.Pip -m PyInstaller $b.Spec ... }
-```
+Two defects found while building it:
 
-**Recommendation:** Delete `.venv`, repair pyinstaller install in `.venv311` (`pip install --force-reinstall pyinstaller`), simplify the rebuild script. Document Python version requirement (3.11) in `requirements.txt` or `pyproject.toml`.
+| Issue | Resolution |
+| --- | --- |
+| The flush's own dry run showed loose `audit-*.md`/`snapshot-*.md` at the audit root — the ORIGINAL single-watch layout — were not matched, so 13 files would have survived every flush forever and "flush everything" would have been quietly false. | Widened the loose-file patterns, including the `-wal`/`-shm` sidecars WAL introduced. 37 items, 0 skipped. |
+| The orchestrator's new health check used a 15s window. A PyInstaller onefile extracts ~50 MB per launch (~12s warm, slower cold), so a healthy server was reported as failed. A false alarm on a startup check is as bad as no check — it teaches you to ignore it. | Window raised to 90s; success still returns as soon as `/health` answers, and the wait is now reported. |
 
-### 4. Dashboard runs on a separate HTTP server in a daemon thread
+### Found during the work, not in the report
 
-`dashboard.py:911-921` spins up `http.server.HTTPServer` in a daemon thread on port 7654 (configurable). This is independent of the MCP SSE server on 7702 — different stack, different port, different lifecycle.
+| Issue | Resolution |
+| --- | --- |
+| **The schema migration was dead code.** `CREATE INDEX ... ON events (watch_path)` ran *before* `_migrate()` added that column, so opening any pre-migration database raised `no such column: watch_path` and the advertised upgrade path could never execute. | Split into table → migrate → indexes. `tests/test_storage.py` |
+| The 413 response replied without draining the request body, resetting the client mid-send — the caller got `ConnectionAborted` instead of the error explaining the problem. | Bounded `_drain` before responding. |
 
-Two issues:
-- Daemon-thread design means the dashboard masks main-thread exits. When `uvicorn.run()` crashes (as happened this session), the process appears alive because the dashboard kept running — silent failure.
-- Two HTTP servers in one process complicates port-conflict diagnosis.
+### Testing and packaging
 
-**Recommendation:** Either mount the dashboard as a Starlette route on the same uvicorn app (port 7702 with `/dashboard` path), or move it to a separate sidecar process. Either way, drop the `http.server` stdlib dependency.
-
-### 5. AmbientNotifier silent-degrade design
-
-`ambient_notifier.py:215-244` has a `_trigger_recovery()` path: if the SentenceTransformer model fails to load (no `sentence-transformers` installed, or chromadb unreachable), it logs a warning and degrades the notifier to no-op with an exponential-backoff recovery thread.
-
-This is well-intentioned but brittle:
-- The recovery thread runs forever (no max attempts)
-- "Degraded mode" only logs at WARN level, easy to miss in production
-- No health endpoint exposes whether the notifier is OK / degraded / recovering
-- If chromadb's GLOBAL_SYNAPSE_PATH is on a network drive that goes offline, this thread will spin
-
-**Recommendation:** Add a `/health` route to the dashboard exposing `{sentinel: ok, ambient: degraded, observer: ok}`. Cap recovery attempts. Make degraded mode user-visible.
-
----
-
-## Build / Packaging Debt
-
-### 6. PyInstaller spec has weird `pathex`
-
-`shadow-core-sentinel.spec:19`:
-```python
-pathex=['E:/AI Backup Projects/Shadow-Core Engineer'],
-```
-
-Hardcoded absolute path to a **different project's directory**. Likely intentional — Sentinel's `mcp_server.py:18-21` inserts the Engineer dir into sys.path to import shared `telemetry` module. But baking the absolute path into the spec breaks portability and fails on any other machine.
-
-**Recommendation:** Resolve relative to `SPECPATH` in the spec, like Knowledge does:
-```python
-_HERE = os.path.dirname(os.path.abspath(SPEC))
-_ENGINEER_DIR = os.path.abspath(os.path.join(_HERE, '..', 'Shadow-Core Engineer'))
-pathex=[_ENGINEER_DIR]
-```
-
-### 7. `hiddenimports = ['watchdog']` is incomplete
-
-Only `watchdog` and `telemetry` are listed. `fastmcp`, `mcp`, `starlette`, `uvicorn`, etc. are pulled in via `collect_all('mcp')` / `collect_all('fastmcp')` which works but is fragile — if a new transitive import is added to `main.py` or `mcp_server.py`, build may succeed but exe will fail at runtime with `ModuleNotFoundError`.
-
-**Recommendation:** Audit the dependency graph and pin known-needed modules explicitly. Add `chromadb`, `sentence_transformers`, `numpy` if AmbientNotifier is to work in the frozen exe.
-
-### 8. Log files committed to repo root
-
-`sentinel_err.log` and `sentinel_out.log` sit in repo root and were both empty at audit time. If anything ever did write to them, they'd accumulate forever. Also `test_event.tmp` is committed and clearly a leftover.
-
-**Recommendation:** Add to `.gitignore`: `*.log`, `*.tmp`, `audit_logs/`, `build/`, `dist/`, `__pycache__/`. Delete the existing files.
+| # | Issue | Resolution |
+| --- | --- | --- |
+| 17 | No test imported `mcp_server`, `main` or `dashboard`; `Settings`, `EventStore._migrate`, `ReportBuilder` and `hasher`'s retry branch were uncovered. | 65 → 199 tests. New: `test_primary_selection`, `test_config_ignores`, `test_storage`, `test_report_builder`, `test_dashboard_api`, `test_dashboard_wiring`, `test_hasher`. |
+| 18 | `pytest` was required by every test file and declared in no manifest; no `pyproject.toml`; Python version recorded only in the name of a virtualenv directory. | `pyproject.toml` with `requires-python = ">=3.11"` and a `[dev]` extra. `pytest.ini` folded in. |
+| 19 | `dashboard-rs/` carried a second dependency tree (axum, tokio, rusqlite-bundled) plus a Rust and C toolchain requirement, for a binary nothing built. | Deleted with the component. |
+| 20 | README told users to register a stdio `"command"`/`"args"` server, which hangs — `mcp_config.json` existed specifically to say so. | Rewritten: SSE config, flags, environment variables, endpoints. |
+| 21 | Nothing in the repo installed or started the service, though `mcp_config.json` and `SENTINEL.md` both assert it starts at logon. | `INSTALL.md`, `install.ps1`, `uninstall.ps1`. The existing mechanism was found during the work and is now documented: a scheduled task "Shadow Core MCP Servers" running `E:\AI Backup Projects\start-shadow-core-mcp.ps1`, a seven-server orchestrator outside this repo. `install.ps1` is for a standalone install and must NOT be used alongside it — see the warning at the top of INSTALL.md. |
 
 ---
 
-## Runtime / Operational Debt
+## Open
 
-### 9. PyInstaller bundles produce no console output when started via `Start-Process -WindowStyle Hidden`
+Nothing outstanding from this audit.
 
-The spec sets `console=True` so a console should be created, but when launched hidden the stdout/stderr streams have nowhere to go and Python's print/logger calls go to the void. This made debugging the FastMCP API mismatch nearly impossible — we eventually had to switch to `[System.Diagnostics.Process]::Start` with explicit stream redirection.
+Known and accepted:
 
-**Recommendation:** In `main.py`, add file-based logging at the top of `main()` so a log file is always written regardless of how the exe is launched:
-```python
-logging.basicConfig(
-    handlers=[logging.FileHandler(settings.audit_dir / "sentinel.log"),
-              logging.StreamHandler(sys.stderr)],
-    ...
-)
-```
-
-### 10. Elevated-process kill problem
-
-When Sentinel is started by Task Scheduler at logon (the configured startup path), the process runs at elevated integrity. A non-elevated `taskkill /F /PID <pid>` returns "Access denied." This made every rebuild attempt this session require manual Task Manager intervention.
-
-**Recommendation:** Either:
-- Run the startup script under a normal user trigger (not "highest privileges" in Task Scheduler), OR
-- Add a `--stop` flag to a wrapper script that signals via a named pipe or an HTTP endpoint (`POST /admin/shutdown` on the dashboard with a local-only auth check)
-
-### 11. ZMQ port hardcoded to 5557 (related to Memory server)
-
-Note: Sentinel itself doesn't use ZMQ, but the Memory server it interoperates with does (`memory_server/server.py:184`). If anything else on the user's machine grabs port 5557, Memory's ZMQ listener thread retries with backoff but never aborts. Not Sentinel's bug, but worth a cross-team fix.
-
-### 12. `bootloader_ignore_signals` not set in Sentinel spec
-
-Unlike Knowledge (which sets `bootloader_ignore_signals=True`), Sentinel's spec leaves it at default (False). This means SIGINT/SIGTERM goes to the PyInstaller bootloader, which may not propagate to the Python child cleanly. Mixed signal-handling design between servers.
-
-**Recommendation:** Standardize on one approach across all 7 servers, document the choice.
+- **One default project across sessions.** `watch_project` moves the shared
+  `primary`, so two sessions on two projects share one default view. This cannot
+  be resolved without per-session identity, which MCP does not provide. Writes
+  are unaffected — every project records to its own database regardless.
+- **Rate alerts are process-wide**, by design (see #13). Labelled as such.
 
 ---
 
-## Code Smells (Lower Priority)
+## History
 
-### 13. `main.py` is doing too much
-
-`main()` is 175 lines and does: argument parsing, settings mutation, logger config, EventStore init, ReportBuilder init, AuditEventHandler wiring, AmbientNotifier wiring, observer startup, dashboard config (with 8 closures defined inline), MCP server build, SSE handler definition, Starlette app construction, uvicorn launch, and cleanup. Hard to test any piece in isolation.
-
-**Recommendation:** Extract dashboard wiring into `dashboard_wiring.py`, MCP transport setup into `sse_app.py`. Aim for a `main()` under 40 lines.
-
-### 14. Mutable-container pattern for pivot
-
-`store_ref = [EventStore(...)]` / `builder_ref = [ReportBuilder(...)]` — using single-element lists as mutable boxes so closures can swap them on `pivot_room`. Works but is non-obvious and a maintenance hazard.
-
-**Recommendation:** Wrap in a small `class SentinelState: def __init__(self): self.store = ...; self.builder = ...` and capture the state object in closures. Reassigning `state.store` is clearer than `store_ref[0]`.
-
-### 15. Test suite status unknown
-
-No `tests/` directory visible at repo root. `pytest` is excluded from PyInstaller build (smart for size), but is there even a test runner config? If tests exist, they should at minimum cover: EventStore round-trip, observer event filtering, AmbientNotifier scoring (with model mocked), pivot_room state transitions.
-
-**Recommendation:** Establish baseline test coverage before any further refactor.
-
----
-
-## Recommended Sprint Priorities
-
-| # | Item | Effort | Risk if not done |
-|---|------|--------|------------------|
-| 1 | Verify port 7702 binds after this session's fix | 5 min | Server actually broken |
-| 2 | File-based logging in `main()` so failures are visible | 30 min | Continued blind debugging |
-| 3 | Pick one MCP library (Issue #2) — convert to pure fastmcp | 2-4 hrs | Future API drift breaks again |
-| 4 | Health endpoint for AmbientNotifier degradation | 1 hr | Silent degradation in prod |
-| 5 | Spec `pathex` portability fix | 15 min | Anyone else cloning fails |
-| 6 | Clean elevated-kill problem (admin shutdown route) | 1 hr | Every redeploy is painful |
-| 7 | Delete `.venv`, document `.venv311` only | 15 min | Confusion |
-| 8 | `.gitignore` cleanup + remove tracked logs/tmp | 15 min | Repo bloat |
-| 9 | Extract `main()` (Issue #13) | 2-3 hrs | Future changes risky |
-| 10 | Test suite baseline | 1 day | No regression safety |
-
----
-
-## Files Modified This Session
-
-- `mcp_server.py` — line 147: `return mcp` → `return mcp._mcp_server`
-- `main.py` — entire `main()` body changed from stdio to SSE/uvicorn (in prior session)
-
-## Files Untouched But Reviewed
-
-- `dashboard.py`, `observer.py`, `ambient_notifier.py`, `config.py`, `models.py`, `storage.py`, `report_builder.py`, `differ.py`, `hasher.py`
-
----
-
-*End of audit. See companion `TECH_DEBT_AUDIT.md` in Shadow-Core Global Knowledge for the Knowledge server review.*
+The 2026-05-17 audit has been superseded. It described `ambient_notifier.py`
+(deleted in `1ff0277`), a `.venv` alongside `.venv311` (only the latter exists),
+a hardcoded sibling-project `pathex` in the spec (fixed), a mixed
+`fastmcp`/`mcp.server` split (fixed), and stated "No `tests/` directory visible
+at repo root". Its issue numbers were cited as live justification by
+`dashboard-rs`, which is how a false premise outlived the document that carried
+it — the reason this file is now rewritten rather than appended to. It remains
+in git history.

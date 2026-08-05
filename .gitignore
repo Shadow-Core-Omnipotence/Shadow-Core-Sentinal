@@ -3,6 +3,10 @@
 # Build artefacts
 build/
 dist/
+# PyInstaller cannot write into a directory whose exe is running, so rebuilds
+# stage into these and are promoted afterwards. See INSTALL.md.
+build_new/
+dist_new/
 *.pyc
 *.pyo
 __pycache__/
@@ -37,9 +41,6 @@ Thumbs.db
 # Runtime databases and other tools' backups
 .mempalace.db
 .shadow_engineer_backups/
-
-# Rust dashboard build output
-dashboard-rs/target/
 
 # pytest
 .pytest_cache/

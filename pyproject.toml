@@ -1,0 +1,55 @@
+[project]
+name = "shadow-core-sentinel"
+version = "1.2.1"
+description = "Filesystem audit trail served over MCP — records every change under a watched directory with a SHA-256, so a change can be confirmed against what actually happened on disk."
+readme = "README.md"
+
+# 3.11 was implied only by the name of the `.venv311` directory. The pins in
+# requirements.txt are verified against it, and `from __future__ import
+# annotations` plus `X | None` syntax in signatures put the real floor at 3.10;
+# 3.11 is what this is built and tested on.
+requires-python = ">=3.11"
+
+dependencies = [
+    "fastmcp==3.2.4",
+    "mcp==1.27.0",
+    "watchdog==6.0.0",
+    "uvicorn==0.46.0",
+    "starlette==1.0.0",
+    "anyio==4.13.0",
+]
+
+[project.optional-dependencies]
+# `pip install -r requirements.txt` per the README could not run the test suite:
+# pytest is required by pytest.ini and every test file, and appeared in no
+# manifest at all. `pip install -e ".[dev]"` now gets you a working checkout.
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+shadow-core-sentinel = "main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: exercises real filesystem timing; seconds rather than milliseconds",
+]
+
+[tool.ruff]
+line-length = 100
+exclude = [".venv311", "build", "dist", "scratch", "audit_logs", "watched"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test modules insert the repo root on sys.path before importing the code under
+# test, so their imports cannot come first.
+"tests/*" = ["E402"]
+# dashboard.py is mostly one long HTML/CSS/JS template string. A Python line
+# limit says nothing useful about a CSS rule or a template literal, and
+# rewrapping them to satisfy it would make the markup harder to read. Every
+# other rule still applies to the module's actual Python.
+"dashboard.py" = ["E501"]
