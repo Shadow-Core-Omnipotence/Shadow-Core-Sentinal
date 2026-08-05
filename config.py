@@ -3,14 +3,17 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
-import re
 
-
-def _safe_dir_name(path: Path) -> str:
-    """Convert a path to a safe directory name using the watched folder name."""
-    name = path.name or path.drive.replace(":", "").replace("\\", "")
-    # Replace unsafe chars with hyphens
-    return re.sub(r'[^\w\-]', '-', name).strip('-') or "default"
+# ONE implementation of the audit-folder naming rule, not two.
+#
+# `config._safe_dir_name` and `watch_registry.safe_project_name` were
+# byte-identical, and watch_registry's docstring warned that letting them
+# diverge would orphan every existing sentinel.db — while nothing stopped that
+# happening, and only one of the two was covered by a test. The registry's copy
+# is the one that decides where a watched project's database actually lives, so
+# it is the one that survives. No cycle: watch_registry imports nothing from
+# this module.
+from watch_registry import safe_project_name
 
 
 @dataclass
@@ -33,7 +36,28 @@ class Settings:
     dashboard_enabled: bool = os.environ.get("DASHBOARD_ENABLED", "true").lower() == "true"
     dashboard_port: int = int(os.environ.get("DASHBOARD_PORT", "7654"))
 
+    # The MCP SSE endpoint. These were literals at the `mcp.run(...)` call site,
+    # repeated in the log line beside it, and unreachable from configuration —
+    # while `--port`, the only port flag, moved the DASHBOARD. Loopback is the
+    # default and should stay it: this serves a filesystem audit trail, which
+    # has no business being reachable off-machine.
+    mcp_host: str = os.environ.get("MCP_HOST", "127.0.0.1")
+    mcp_port: int = int(os.environ.get("MCP_PORT", "7702"))
+
     log_level: str = os.environ.get("LOG_LEVEL", "INFO")
+
+    # Delete all recorded audit data at startup, so a run begins with no
+    # history. Sentinel already discards its watches and its in-RAM ring on
+    # restart; this completes that.
+    #
+    # The trade is deliberate and one-way: cross-restart forensics — "what
+    # changed while I wasn't looking" — becomes unanswerable, because the
+    # evidence is gone before the question can be asked. What it buys is
+    # bounded disk. Without it the trail had reached 252 MB with no retention
+    # policy of any kind, 38% of that a dead project born from a typo.
+    # Set SENTINEL_FLUSH_ON_START=false to keep history across restarts.
+    flush_on_start: bool = os.environ.get(
+        "SENTINEL_FLUSH_ON_START", "true").lower() == "true"
 
     # Idle watches suspend themselves after this long with no events and no
     # prompt (see lease.py). Suspension is not removal — the entry, its store
@@ -85,41 +109,42 @@ class Settings:
 
     def _refresh_project_paths(self) -> None:
         """Recompute audit_dir and db_path from the current watch_dir."""
-        project_name = _safe_dir_name(self.watch_dir)
+        project_name = safe_project_name(self.watch_dir)
         self.audit_dir = self.base_audit_dir / project_name
         self.audit_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.audit_dir / "sentinel.db"
-        self._auto_ignore_audit_dir()
-
-    def _auto_ignore_audit_dir(self) -> None:
-        """Always ignore the audit_dir, whether inside or outside watch_dir."""
-        try:
-            rel = self.audit_dir.relative_to(self.watch_dir)
-            anchor = rel.parts[0]
-            if anchor not in self.ignore_patterns:
-                self.ignore_patterns.append(anchor)
-        except ValueError:
-            pass
-        audit_str = str(self.audit_dir)
-        if audit_str not in self.ignore_patterns:
-            self.ignore_patterns.append(audit_str)
-        # Also ignore the base audit dir
-        base_str = str(self.base_audit_dir)
-        if base_str not in self.ignore_patterns:
-            self.ignore_patterns.append(base_str)
 
     def is_ignored(self, path: Path) -> bool:
-        # Explicit audit dir checks first
-        try:
-            path.relative_to(self.audit_dir)
-            return True
-        except ValueError:
-            pass
-        try:
-            path.relative_to(self.base_audit_dir)
-            return True
-        except ValueError:
-            pass
+        # Audit output is skipped by CONTAINMENT, not by pattern.
+        #
+        # There used to be an `_auto_ignore_audit_dir()` that ran on every
+        # `update_watch_dir` and appended three entries to the shared
+        # `ignore_patterns` list: the audit dir, the base audit dir, and —
+        # the damaging one — `rel.parts[0]`, the first path component between
+        # the watched root and the audit dir. That last one is a BARE DIRECTORY
+        # NAME, and the loop below matches bare names against every component of
+        # every path in every watched project.
+        #
+        # Measured: pivoting to `E:\AI Backup Projects` derived the anchor
+        # `Shadow-Core Sentinel` and appended it, after which
+        # `is_ignored(...\Shadow-Core Sentinel\main.py)` returned True — Sentinel
+        # silently stopped recording its own repository, and would stop recording
+        # any other project with a component of that name, for the life of the
+        # process. One dashboard pivot could blind an unrelated session's watch.
+        # The list also grew monotonically with absolute paths that were never
+        # pruned.
+        #
+        # All three entries were redundant: the two containment checks below
+        # already cover the audit tree completely, and cover it for EVERY
+        # project at once, because every project's audit dir lives under
+        # `base_audit_dir`. Deleting the pattern-writing left the behaviour that
+        # was wanted and removed the one that was not.
+        for root in (self.audit_dir, self.base_audit_dir):
+            try:
+                path.relative_to(root)
+                return True
+            except ValueError:
+                pass
 
         parts = path.parts
         for pattern in self.ignore_patterns:
@@ -147,7 +172,7 @@ class Settings:
 
     @property
     def project_name(self) -> str:
-        return _safe_dir_name(self.watch_dir)
+        return safe_project_name(self.watch_dir)
 
 
 settings = Settings()

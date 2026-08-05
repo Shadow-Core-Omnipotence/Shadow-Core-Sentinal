@@ -7,7 +7,7 @@ _CHUNK = 1 << 20  # 1 MiB
 
 def sha256_of(path: Path, max_retries: int = 3) -> Optional[str]:
     """
-    Computes SHA-256 with exponential backoff to handle transient 
+    Computes SHA-256 with exponential backoff to handle transient
     OS file locks during rapid IDE write/build cycles.
     """
     backoff = 0.1
@@ -19,15 +19,15 @@ def sha256_of(path: Path, max_retries: int = 3) -> Optional[str]:
                 for chunk in iter(lambda: fh.read(_CHUNK), b""):
                     h.update(chunk)
             return h.hexdigest()
-            
+
         except PermissionError:
             if attempt < max_retries:
                 time.sleep(backoff)
                 backoff *= 2
                 continue
             return None
-            
+
         except OSError:
-            return None 
+            return None
 
     return None

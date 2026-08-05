@@ -4,15 +4,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+
 class EventKind(str, Enum):
     CREATED = "CREATED"
     MODIFIED = "MODIFIED"
     DELETED = "DELETED"
     MOVED = "MOVED"
-
-class SentinelState(str, Enum):
-    OK = "OK"
-    DEGRADED = "DEGRADED"
 
 @dataclass(frozen=True)
 class AuditEvent:

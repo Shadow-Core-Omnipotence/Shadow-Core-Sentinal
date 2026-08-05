@@ -4,7 +4,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, Deque, Dict, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional
 
 from watchdog.events import (
     FileCreatedEvent,
@@ -28,7 +28,8 @@ DEBOUNCE_SECONDS = 0.5
 class AlertManager:
     """Fires a callback if event rate exceeds threshold."""
 
-    def __init__(self, max_events: int, window_seconds: int, on_alert: Callable[[int, int], None]) -> None:
+    def __init__(self, max_events: int, window_seconds: int,
+                 on_alert: Callable[[int, int], None]) -> None:
         self._max = max_events
         self._window = window_seconds
         self._on_alert = on_alert
@@ -100,10 +101,6 @@ class AuditEventHandler(FileSystemEventHandler):
     def recent_events(self, n: int = 50) -> List[AuditEvent]:
         with self._lock:
             return list(self._ring)[-n:]
-
-    def events_for_date(self, date_key: str) -> List[AuditEvent]:
-        with self._lock:
-            return [e for e in self._ring if e.date_key() == date_key]
 
     def on_created(self, event: FileCreatedEvent) -> None:
         if event.is_directory:
@@ -205,18 +202,17 @@ class AuditEventHandler(FileSystemEventHandler):
         self._executor.shutdown(wait=True)
 
 
-def start_observer(handler: AuditEventHandler) -> Observer:
-    obs = Observer()
-    handler._watch = obs.schedule(handler, str(settings.watch_dir), recursive=settings.recursive)
-    obs.start()
-    return obs
-
-
 def start_bare_observer() -> Observer:
     """A running observer with NO watches scheduled yet.
 
     Multi-watch startup schedules each project through add_watch() instead of
     baking one path in at construction, so the first watch is not special.
+
+    This replaced a `start_observer(handler)` that scheduled the single global
+    `settings.watch_dir` at construction. It had no callers left but still read
+    as the supported entry point, while quietly contradicting the multi-watch
+    design — anyone using it would have bound one project and made it special
+    again.
     """
     obs = Observer()
     obs.start()

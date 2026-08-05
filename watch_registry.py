@@ -34,6 +34,7 @@ tested without SQLite, watchdog, or touching a disk.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -47,12 +48,11 @@ logger = logging.getLogger("sc.sentinel.watch")
 def safe_project_name(path: Path) -> str:
     """Directory name for a watched path's audit folder.
 
-    Mirrors config._safe_dir_name so a project keeps the SAME audit directory
-    it had under the single-watch design. Changing this would orphan every
-    existing sentinel.db.
+    THE single definition of this rule — `config` imports it from here rather
+    than keeping the byte-identical copy it used to have. A project must keep
+    the SAME audit directory it had under the single-watch design; two
+    implementations free to drift would orphan every existing sentinel.db.
     """
-    import re
-
     name = path.name or path.drive.replace(":", "").replace("\\", "")
     return re.sub(r"[^\w\-]", "-", name).strip("-") or "default"
 

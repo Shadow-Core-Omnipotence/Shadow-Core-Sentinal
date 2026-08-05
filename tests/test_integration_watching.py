@@ -16,7 +16,6 @@ path a change actually takes: file written → watchdog → handler → hasher �
 router → the owning project's database.
 """
 import time
-from pathlib import Path
 
 import pytest
 
