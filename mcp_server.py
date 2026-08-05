@@ -4,13 +4,19 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict
 
 from fastmcp import FastMCP
 
-from config import settings
 from differ import diff_strings
+
+# Imported at module scope, not inside the two tools that call them. Hiding
+# these in function bodies concealed a real dependency of this module on
+# `observer` from every reader and from the static import graph. No cycle:
+# observer imports config, hasher and models, none of which import this.
+from observer import add_watch, remove_watch
 
 # NOTE (2026-07-31): this module used to reach into a SIBLING PROJECT --
 # `sys.path.insert(0, '../Shadow-Core Engineer')` followed by
@@ -36,6 +42,24 @@ logger = logging.getLogger("sc.sentinel.mcp")
 # ── Module-level FastMCP instance (replaces Server factory) ───────────────
 mcp = FastMCP("shadow-core-sentinel")
 
+# Sentinel boots watching nothing, so "idle" is a NORMAL state that every read
+# tool has to answer for — not an error. It used to be answered two different
+# ways from this one file: the event tools returned this dict, while the four
+# builder-backed tools dereferenced `state.builder` unguarded and raised
+# AttributeError: 'NoneType' object has no attribute 'list_artifacts'. One
+# behaviour, stated once, so a tool added later inherits the right one.
+IDLE_RESULT = {
+    "status": "idle",
+    "message": "No project is being watched. Call watch_project first.",
+    "count": 0,
+    "events": [],
+}
+
+
+def _idle() -> Dict:
+    """A fresh copy — callers add keys to their response."""
+    return dict(IDLE_RESULT)
+
 
 def build_mcp_server(state) -> FastMCP:
     """
@@ -58,6 +82,8 @@ def build_mcp_server(state) -> FastMCP:
     @mcp.resource("audit://logs/{date_key}")
     async def read_log(date_key: str) -> str:
         """Read a daily audit log by date key (YYYY-MM-DD)."""
+        if state.builder is None:
+            return "No project is being watched. Call watch_project first."
         content = state.builder.read_artifact(date_key)
         if not content:
             return f"No audit log found for {date_key}"
@@ -66,7 +92,9 @@ def build_mcp_server(state) -> FastMCP:
     @mcp.resource("audit://snapshots/{snap_name}")
     async def read_snapshot(snap_name: str) -> str:
         """Read an audit snapshot by filename."""
-        content = state.builder.read_artifact_by_path(settings.audit_dir / snap_name)
+        if state.builder is None:
+            return "No project is being watched. Call watch_project first."
+        content = state.builder.read_artifact_by_name(snap_name)
         if not content:
             return f"No snapshot found: {snap_name}"
         return content
@@ -76,6 +104,8 @@ def build_mcp_server(state) -> FastMCP:
     @mcp.tool()
     async def list_audit_dates() -> Dict:
         """List all available audit log dates (YYYY-MM-DD)."""
+        if state.builder is None:
+            return {**_idle(), "dates": []}
         artifacts = state.builder.list_artifacts()
         dates = []
         for artifact in artifacts:
@@ -92,6 +122,8 @@ def build_mcp_server(state) -> FastMCP:
         Args:
             date_key: Date in YYYY-MM-DD format (e.g. '2026-05-06').
         """
+        if state.builder is None:
+            return {**_idle(), "date": date_key}
         content = state.builder.read_artifact(date_key)
         if not content:
             return {"status": "error", "message": f"No report for {date_key}"}
@@ -127,12 +159,8 @@ def build_mcp_server(state) -> FastMCP:
             limit: Maximum rows returned. Default 100.
             include_hashes: Include the SHA-256 of each file. Default False.
         """
-        from datetime import timedelta
-
         if state.store is None:
-            return {"status": "idle",
-                    "message": "No project is being watched. Call watch_project first.",
-                    "count": 0, "events": []}
+            return _idle()
 
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max(1, minutes)))
         since_iso = cutoff.isoformat()
@@ -141,7 +169,7 @@ def build_mcp_server(state) -> FastMCP:
                                          include_hashes=include_hashes)
         return {
             "status": "ok",
-            "project": str(state.primary),
+            "project": str(state.primary_path) if state.primary_path else None,
             "window_minutes": minutes,
             "total_in_window": total,
             "returned": len(events),
@@ -164,9 +192,7 @@ def build_mcp_server(state) -> FastMCP:
             include_hashes: Include the SHA-256 of each file. Default False.
         """
         if state.store is None:
-            return {"status": "idle",
-                    "message": "No project is being watched. Call watch_project first.",
-                    "count": 0, "events": []}
+            return {**_idle(), "date": date_key}
 
         events = state.store.query_by_date(date_key)
         total = len(events)
@@ -198,9 +224,17 @@ def build_mcp_server(state) -> FastMCP:
             "suspended_watches": [
                 str(e.path) for e in state.registry.suspended_entries()
             ] if state.registry else [],
-            "primary_watch": str(state.primary) if state.primary else None,
+            "primary_watch": str(state.primary_path) if state.primary_path else None,
             "total_events": state.store.total_count() if state.store else 0,
-            "observer_alive": state.observer.is_alive() if hasattr(state.observer, "is_alive") else "unknown",
+            # Rows Sentinel was asked to write and could not. Non-zero means the
+            # audit trail is INCOMPLETE and its answers cannot be trusted as
+            # exhaustive — previously such failures were logged and forgotten.
+            "failed_writes": sum(
+                getattr(e.store, "failed_writes", 0) or 0
+                for e in state.registry.entries() if e.store
+            ) if state.registry else 0,
+            "observer_alive": (state.observer.is_alive()
+                               if hasattr(state.observer, "is_alive") else "unknown"),
         }
 
     @mcp.tool()
@@ -212,8 +246,10 @@ def build_mcp_server(state) -> FastMCP:
             snapshot_a: First snapshot filename.
             snapshot_b: Second snapshot filename.
         """
-        content_a = state.builder.read_artifact_by_path(settings.audit_dir / snapshot_a)
-        content_b = state.builder.read_artifact_by_path(settings.audit_dir / snapshot_b)
+        if state.builder is None:
+            return {**_idle(), "snapshot_a": snapshot_a, "snapshot_b": snapshot_b}
+        content_a = state.builder.read_artifact_by_name(snapshot_a)
+        content_b = state.builder.read_artifact_by_name(snapshot_b)
         if content_a is None:
             return {"status": "error", "message": f"Snapshot not found: {snapshot_a}"}
         if content_b is None:
@@ -254,11 +290,9 @@ def build_mcp_server(state) -> FastMCP:
         Args:
             path: Absolute path of the project directory to watch.
         """
-        from pathlib import Path as _Path
-
         if not path:
             return {"status": "error", "message": "No path provided"}
-        p = _Path(path).expanduser()
+        p = Path(path).expanduser()
         try:
             p = p.resolve()
         except OSError as exc:
@@ -270,7 +304,6 @@ def build_mcp_server(state) -> FastMCP:
         already = existing is not None
         entry = state.registry.add(p)
         if not already:
-            from observer import add_watch
             entry.handle = add_watch(state.observer, state.handler, entry.path)
 
         # An idle watch suspends itself rather than being removed, so a repeat
@@ -283,6 +316,21 @@ def build_mcp_server(state) -> FastMCP:
             resumed = bool(state.resume(entry, reason="watch_project"))
         else:
             entry.touch()
+
+        # The session has just said where it is working, so that is what the
+        # read-side tools should describe. This used to be set ONLY by the
+        # dashboard's pivot, which meant a session driven purely over MCP left
+        # `primary` at None and every read tool — recent_changes, query_events,
+        # the reports, /health — answered "no project is being watched" while
+        # recording was working perfectly. Confirmed live: two projects watched,
+        # primary None, recent_changes reporting idle.
+        #
+        # Like pivot, this moves the DEFAULT VIEW only; no other session's watch
+        # is stopped. Two sessions on two projects still share one default, which
+        # cannot be resolved without per-session identity that MCP does not
+        # provide — but a stale default is recoverable, and reading nothing at
+        # all is not.
+        state.primary = entry.path
 
         return {
             "status": "ok",
@@ -308,17 +356,14 @@ def build_mcp_server(state) -> FastMCP:
         Args:
             path: Absolute path of the project directory to stop watching.
         """
-        from pathlib import Path as _Path
-
         if not path:
             return {"status": "error", "message": "No path provided"}
-        p = _Path(path).expanduser().resolve()
+        p = Path(path).expanduser().resolve()
 
         entry = state.registry.get(p)
         if entry is None:
             return {"status": "error", "message": f"Not being watched: {p}"}
 
-        from observer import remove_watch
         remove_watch(state.observer, entry.handle)
         state.registry.remove(p)
         if state.primary == entry.path:
@@ -345,7 +390,7 @@ def build_mcp_server(state) -> FastMCP:
         return {
             "status": "ok",
             "count": len(state.registry),
-            "primary": str(state.primary),
+            "primary": str(state.primary_path) if state.primary_path else None,
             "projects": [
                 {
                     "path": str(e.path),

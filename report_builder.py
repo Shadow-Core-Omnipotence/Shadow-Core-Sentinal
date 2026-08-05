@@ -1,12 +1,11 @@
 import logging
-import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from config import settings
-from hasher import sha256_of
+from lease import scan_tree
 from models import AuditEvent, EventKind
 
 logger = logging.getLogger(__name__)
@@ -79,18 +78,27 @@ class ReportBuilder:
         return path
 
     def build_disk_snapshot(self, label: str = "disk") -> Path:
-        entries: List[tuple[Path, Optional[str]]] = []
-        for root, dirs, files in os.walk(self.watch_path):
-            dirs[:] = [d for d in dirs if not settings.is_ignored(Path(root) / d)]
-            for name in sorted(files):
-                fpath = Path(root) / name
-                if not settings.is_ignored(fpath):
-                    entries.append((fpath, sha256_of(fpath)))
-                
+        """Inventory this project's tree with a SHA-256 per file.
+
+        The walk itself is `lease.scan_tree` — the same one suspension uses to
+        take its baseline. It was written twice, once here reading the global
+        `settings.is_ignored` and once there taking an injected predicate, which
+        meant two answers to "what is in this tree" that were free to disagree
+        about the same directory. A snapshot and a gap report describing the
+        same project differently is precisely the confident wrongness this
+        service exists to rule out.
+
+        Paths are recorded RELATIVE to the watched root, as scan_tree keys them.
+        The header names the root, so nothing is lost, and a snapshot becomes
+        comparable with a gap report — and with a snapshot of the same project
+        taken from a different absolute path.
+        """
+        entries = sorted(scan_tree(self.watch_path, settings.is_ignored).items())
+
         ts = datetime.now(tz=timezone.utc)
         filename = f"snapshot-{ts.strftime('%Y%m%dT%H%M%SZ')}-{label}.md"
         path = self._audit_dir / filename
-        
+
         lines = [
             f"# Disk State Snapshot — {label}",
             "",
@@ -103,11 +111,13 @@ class ReportBuilder:
             "| Path | SHA-256 |",
             "| --- | --- |",
         ]
-        
-        for fpath, digest in entries:
+
+        for rel, digest in entries:
+            # An unreadable file is UNKNOWN, not absent — it is listed with its
+            # hash marked rather than dropped from the inventory.
             sha = f"`{digest}`" if digest else "*unreadable*"
-            lines.append(f"| `{fpath}` | {sha} |")
-            
+            lines.append(f"| `{rel}` | {sha} |")
+
         with self._lock:
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
@@ -125,12 +135,34 @@ class ReportBuilder:
         with self._lock:
             return path.read_text(encoding="utf-8") if path.exists() else None
 
+    def read_artifact_by_name(self, name: str) -> Optional[str]:
+        """Read an artifact by filename from THIS project's audit directory.
+
+        Callers used to build the path themselves as `settings.audit_dir / name`,
+        which is the GLOBAL audit dir — derived from `settings.watch_dir`, a
+        value `watch_project` never updates. It stays at the boot default, so
+        every snapshot read resolved into `audit_logs/watched/`, a directory no
+        watched project writes into, while the names being passed in came from
+        this builder's own `list_artifacts()`. Owning the join here means the
+        directory listed and the directory read are the same one by
+        construction.
+
+        A name is a FILENAME, not a path: anything with a separator or a `..`
+        is refused rather than resolved, so a snapshot name can never be used to
+        read outside the project's audit directory.
+        """
+        if not name or name != Path(name).name or name in (".", ".."):
+            logger.warning("Refusing non-filename artifact reference: %r", name)
+            return None
+        return self.read_artifact_by_path(self._audit_dir / name)
+
     def _initialise_file(self, path: Path, date_key: str) -> None:
         header = "\n".join([
             f"# Folder Audit Log — {date_key}",
             "",
             f"> **Watched directory:** `{self.watch_path}`",
-            f"> **Report generated:** {datetime.now(tz=timezone.utc).isoformat(timespec='milliseconds')}Z",
+            f"> **Report generated:** "
+            f"{datetime.now(tz=timezone.utc).isoformat(timespec='milliseconds')}Z",
             "",
             "## Events",
             "",
