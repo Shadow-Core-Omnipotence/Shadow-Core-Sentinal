@@ -4,10 +4,23 @@ import threading
 from pathlib import Path
 from typing import List, Optional
 
-from models import AuditEvent, EventKind
+from models import AuditEvent
 
 logger = logging.getLogger(__name__)
 
+# Schema setup runs in THREE ordered steps, and the order is load-bearing.
+#
+# These used to be one script: the table plus both indexes, executed before
+# `_migrate()`. On a database predating the `watch_path` column that is fatal —
+# `CREATE TABLE IF NOT EXISTS` is a no-op because the table is already there,
+# then `CREATE INDEX ... ON events (watch_path)` raises
+# "no such column: watch_path" and the constructor dies before the migration
+# that would have added it ever runs. Every pre-migration database was therefore
+# unopenable, and the upgrade path advertised by `_migrate` could not execute.
+# (dashboard-rs reads such files read-only and adapts to the older schema, so
+# they demonstrably still exist.)
+#
+# Table, then column, then indexes.
 CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -19,8 +32,12 @@ CREATE TABLE IF NOT EXISTS events (
     sha256     TEXT,
     watch_path TEXT
 );
+"""
+
+CREATE_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_date_key   ON events (date_key);
 CREATE INDEX IF NOT EXISTS idx_watch_path ON events (watch_path);
+CREATE INDEX IF NOT EXISTS idx_ts         ON events (ts);
 """
 
 # Migration: add watch_path column to existing databases that don't have it
@@ -33,11 +50,36 @@ class EventStore:
     def __init__(self, db_path: Path, watch_path: Optional[str] = None) -> None:
         self._path = db_path
         self._watch_path = watch_path
+        self._failed_writes = 0
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._configure()
         self._conn.executescript(CREATE_TABLE)
         self._migrate()
+        self._conn.executescript(CREATE_INDEXES)
         self._conn.commit()
+
+    def _configure(self) -> None:
+        """WAL, so a reader never blocks the writer and a commit is cheaper.
+
+        Every event costs a commit, and a busy project records tens of thousands
+        a day (measured: 19,936 on one date). Under the default rollback journal
+        that is one full fsync each, and it also means the read-only dashboard
+        can be locked out mid-write.
+
+        `synchronous=NORMAL` is the honest setting for WAL here: durable against
+        a process crash, and on an OS crash the most that can be lost is the
+        tail of the log. That loss is recoverable in a way a missing row is not
+        — the tree is still on disk, and a suspend/resume rescan reconstructs
+        the difference. Both pragmas are best-effort: an older SQLite or a
+        filesystem that will not take WAL falls back to the previous behaviour
+        rather than refusing to open the store.
+        """
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error as exc:
+            logger.warning("Could not apply WAL pragmas to %s: %s", self._path, exc)
 
     def _migrate(self) -> None:
         """Add watch_path column if missing (upgrade from older DB)."""
@@ -50,31 +92,94 @@ class EventStore:
                 logger.info("Migrated DB: added watch_path column")
             except Exception as e:
                 logger.error(f"Migration error: {e}")
+                raise
 
-    def set_watch_path(self, watch_path: str) -> None:
-        """Update the watch path tag applied to new events."""
-        self._watch_path = watch_path
+    @staticmethod
+    def _row(event: AuditEvent, watch_path: Optional[str]) -> tuple:
+        return (
+            event.timestamp.isoformat(),
+            event.date_key(),
+            event.kind.value,
+            str(event.src_path),
+            str(event.dest_path) if event.dest_path else None,
+            event.sha256,
+            watch_path,
+        )
 
-    def insert(self, event: AuditEvent) -> None:
+    def insert(self, event: AuditEvent) -> bool:
+        """Record one event. Returns False if the row did not land.
+
+        This used to swallow the exception and return None, so a disk-full,
+        locked-database or schema error was invisible: the caller went on to
+        append the same event to the markdown trail, leaving two records of the
+        same period that disagree, with nothing anywhere saying which is short.
+        For a tool whose entire claim is "this is what actually happened on
+        disk", a silently dropped row is the worst possible failure.
+
+        The exception is still caught — one bad row must not kill the observer
+        thread and stop monitoring altogether — but it is now COUNTED, and the
+        count is surfaced by `sentinel_status` and `/health`.
+        """
         with self._lock:
             try:
                 self._conn.execute(
                     "INSERT INTO events "
                     "(ts, date_key, kind, src_path, dest_path, sha256, watch_path) "
                     "VALUES (?,?,?,?,?,?,?)",
-                    (
-                        event.timestamp.isoformat(),
-                        event.date_key(),
-                        event.kind.value,
-                        str(event.src_path),
-                        str(event.dest_path) if event.dest_path else None,
-                        event.sha256,
-                        self._watch_path,
-                    ),
+                    self._row(event, self._watch_path),
                 )
                 self._conn.commit()
+                return True
             except Exception as e:
-                logger.error(f"DB insert error: {e}")
+                self._failed_writes += 1
+                logger.error("DB insert error (%d failed so far) for %s: %s",
+                             self._failed_writes, event.src_path, e)
+                return False
+
+    def insert_many(self, events: List[AuditEvent]) -> int:
+        """Record a batch in ONE transaction. Returns how many landed.
+
+        Gap reconstruction replays an entire suspension's worth of changes in a
+        tight loop; at one commit per row that is one fsync per file on a diff
+        that can cover a whole tree. The batch is atomic — either the resumed
+        window is recorded or it is not, which is the right granularity for a
+        report that claims to describe exactly that window.
+
+        Falls back to per-row inserts if the batch fails, so one unserialisable
+        event costs its own row rather than the entire reconstruction.
+        """
+        if not events:
+            return 0
+        with self._lock:
+            try:
+                self._conn.executemany(
+                    "INSERT INTO events "
+                    "(ts, date_key, kind, src_path, dest_path, sha256, watch_path) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    [self._row(e, self._watch_path) for e in events],
+                )
+                self._conn.commit()
+                return len(events)
+            except Exception as exc:
+                self._conn.rollback()
+                logger.warning(
+                    "Batch insert of %d event(s) failed (%s) — retrying row by row",
+                    len(events), exc)
+
+        written = 0
+        for event in events:
+            if self.insert(event):
+                written += 1
+        return written
+
+    @property
+    def failed_writes(self) -> int:
+        """Rows this store was asked to write and could not.
+
+        Non-zero means the audit trail is INCOMPLETE. It is reported rather
+        than reset, because the gap it describes does not go away.
+        """
+        return self._failed_writes
 
     def query_by_date(self, date_key: str) -> List[dict]:
         with self._lock:

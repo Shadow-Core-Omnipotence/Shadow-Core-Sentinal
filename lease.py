@@ -238,18 +238,36 @@ class WatchLifecycle:
         report_path = Path(entry.audit_dir) / name
         report_path.write_text(report, encoding="utf-8")
 
-        for kind, paths in ((EventKind.CREATED, added),
-                            (EventKind.MODIFIED, modified),
-                            (EventKind.DELETED, removed)):
-            for rel in paths:
-                evt = AuditEvent(
-                    kind=kind,
-                    src_path=Path(entry.path) / rel,
-                    timestamp=resumed_at,
-                    sha256=after.get(rel),
-                )
-                entry.store.insert(evt)
-                entry.builder.append_event(evt)
+        events = [
+            AuditEvent(
+                kind=kind,
+                src_path=Path(entry.path) / rel,
+                timestamp=resumed_at,
+                sha256=after.get(rel),
+            )
+            for kind, paths in ((EventKind.CREATED, added),
+                                (EventKind.MODIFIED, modified),
+                                (EventKind.DELETED, removed))
+            for rel in paths
+        ]
+
+        # One transaction for the whole reconstructed window rather than one
+        # commit per file. A gap diff can cover an entire tree, and the window
+        # is a single claim about a single period — recording it atomically
+        # matches what the report says about it.
+        written = entry.store.insert_many(events)
+        dropped = len(events) - written
+        for evt in events:
+            entry.builder.append_event(evt)
+
+        if dropped:
+            # The gap report exists to say exactly what was and was not
+            # captured. Reconstructed rows that failed to persist are part of
+            # that answer, not a detail to leave in the log.
+            logger.error(
+                "%d of %d reconstructed event(s) for %s could not be persisted — "
+                "%s describes changes the database does not contain",
+                dropped, len(events), entry.project_name, name)
 
         total = len(added) + len(removed) + len(modified)
         if total:
