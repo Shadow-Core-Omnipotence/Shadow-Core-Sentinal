@@ -79,7 +79,7 @@ Two defects found while building it:
 | 18 | `pytest` was required by every test file and declared in no manifest; no `pyproject.toml`; Python version recorded only in the name of a virtualenv directory. | `pyproject.toml` with `requires-python = ">=3.11"` and a `[dev]` extra. `pytest.ini` folded in. |
 | 19 | `dashboard-rs/` carried a second dependency tree (axum, tokio, rusqlite-bundled) plus a Rust and C toolchain requirement, for a binary nothing built. | Deleted with the component. |
 | 20 | README told users to register a stdio `"command"`/`"args"` server, which hangs — `mcp_config.json` existed specifically to say so. | Rewritten: SSE config, flags, environment variables, endpoints. |
-| 21 | Nothing in the repo installed or started the service, though `mcp_config.json` and `SENTINEL.md` both assert it starts at logon. | `INSTALL.md`, `install.ps1`, `uninstall.ps1`. The existing mechanism was found during the work and is now documented: a scheduled task "Shadow Core MCP Servers" running `E:\AI Backup Projects\start-shadow-core-mcp.ps1`, a seven-server orchestrator outside this repo. `install.ps1` is for a standalone install and must NOT be used alongside it — see the warning at the top of INSTALL.md. |
+| 21 | Nothing in the repo installed or started the service, though `mcp_config.json` and `SENTINEL.md` both assert it starts at logon. | `INSTALL.md`, `install.ps1`, `uninstall.ps1`. The existing mechanism was found during the work and is now documented: an external scheduled task running an external startup script outside this repo. `install.ps1` is for a standalone install and must NOT be used alongside it — see the warning at the top of INSTALL.md. |
 
 ---
 

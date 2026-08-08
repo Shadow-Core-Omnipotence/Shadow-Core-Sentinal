@@ -13,7 +13,7 @@
   ```json
   {"sentinel":"ok","version":"1.2.1","observer":"ok","ambient":"ok",
    "ambient_recovery_active":false,"dashboard":"disabled",
-   "watch_dir":"E:\\AI Backup Projects\\Shadow-Core Engineer","total_events":17}
+   "watch_dir":"C:\\path\\to\\Watched-Project","total_events":17}
   ```
 - **Required fixes during verification (3 hidden issues):**
   1. **`fastmcp` missing from `.venv311`** — installed via `pip install fastmcp==3.2.4`.
@@ -54,7 +54,7 @@
 - **Done:**
   - Deleted `.venv` (was missing uvicorn/starlette anyway).
   - Force-reinstalled pyinstaller in `.venv311` — `pyinstaller.exe --version` now returns `6.20.0` cleanly.
-  - Updated `E:\AI Backup Projects\rebuild-shadow-core-mcp.ps1` to point Sentinel at `.venv311\Scripts\pyinstaller.exe` directly (dropped the `python -m PyInstaller` workaround).
+  - Updated build script to point Sentinel at `.venv311\Scripts\pyinstaller.exe` directly (dropped the `python -m PyInstaller` workaround).
 - **Documentation note for future cloners:** `requirements.txt` does not yet declare Python 3.11 requirement explicitly. Add a comment header next session.
 
 ### `[x]` TASK-S08 · `.gitignore` and tracked-cruft cleanup  *(done 2026-05-17)*
@@ -126,7 +126,7 @@
 
 **First wave (low-risk additive):**
 - `[x]` TASK-S02 — File logging added to `main.py`. Writes to `<audit_dir>/sentinel.log` *plus* stderr. UTF-8 encoded.
-- `[x]` TASK-S06 — Spec `pathex` now resolves Engineer dir from `SPEC` location (no hardcoded `E:/` path). Raises `FileNotFoundError` at spec-parse if sibling dir is missing.
+- `[x]` TASK-S06 — Spec `pathex` now resolves Engineer dir from `SPEC` location (no hardcoded path). Raises `FileNotFoundError` at spec-parse if sibling dir is missing.
 - `[x]` TASK-S08 — Created `.gitignore`; deleted `sentinel_err.log`, `sentinel_out.log`, `test_event.tmp`.
 
 **Second wave (refactors + cleanups):**

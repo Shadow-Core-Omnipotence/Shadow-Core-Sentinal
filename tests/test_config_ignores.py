@@ -9,7 +9,7 @@ component-wise against every path in every watched project, so a bare
 directory name landing in it disables recording far beyond the project that
 caused it.
 
-Measured before the fix: after `update_watch_dir(Path(r"E:\\AI Backup Projects"))`
+Measured before the fix: after `update_watch_dir(Path(r"C:\\work\\projects"))`
 the literal pattern `Shadow-Core Sentinel` was added and
 `is_ignored(...\\Shadow-Core Sentinel\\main.py)` returned True — the audit tool
 had stopped recording its own source tree, permanently, with no signal.

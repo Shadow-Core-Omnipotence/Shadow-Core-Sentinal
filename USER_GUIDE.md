@@ -28,11 +28,11 @@ Add the following configuration to your IDE's MCP settings. Replace paths with y
 {
   "mcpServers": {
     "shadow-core-sentinel": {
-      "command": "E:\\AI Backup Projects\\Shadow-Core Sentinal\\dist\\shadow-core-sentinel.exe",
+      "command": "C:\\path\\to\\Shadow-Core-Sentinel\\dist\\shadow-core-sentinel.exe",
       "args": [],
       "env": {
-        "WATCH_DIR": "E:\\AI Backup Projects\\Your-Project-Path",
-        "AUDIT_DIR": "E:\\AI Backup Projects\\Your-Project-Path\\audit_logs"
+        "WATCH_DIR": "C:\\path\\to\\Your-Project-Path",
+        "AUDIT_DIR": "C:\\path\\to\\Your-Project-Path\\audit_logs"
       }
     }
   }

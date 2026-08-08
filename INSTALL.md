@@ -17,9 +17,7 @@ logon task named **"Shadow-Core Sentinel"** that runs `dist\shadow-core-sentinel
 from this directory. That is the whole mechanism, and it is version-controlled
 alongside the code it starts.
 
-It did not used to be. Until 2026-08-05 Sentinel was launched by a scheduled
-task named "Shadow Core MCP Servers" running
-`E:\AI Backup Projects\start-shadow-core-mcp.ps1`, a seven-server orchestrator
+It did not used to be. Previously Sentinel was launched by an external startup script
 living outside any repository — so the startup path and the code it started could
 drift apart, and did: the script passed `--mcp-port` to an exe too old to accept
 the flag, and Sentinel silently failed to start.
@@ -29,15 +27,15 @@ while the logon task exists, or two tasks will race for port 7702 and the loser
 will exit, leaving a task that looks installed while nothing new is running.
 
 <details>
-<summary>The old shared orchestrator (still starts six other servers)</summary>
+<summary>External Orchestrators / Legacy Startup</summary>
 
 ```
-E:\AI Backup Projects\start-shadow-core-mcp.ps1
+C:\path\to\start-mcp-servers.ps1
 ```
 
-A multi-server orchestrator outside any repository. It still starts six servers
-— memory, telemetry, engineer, knowledge, daydream, ambient — hidden, skipping
-any already running.
+An external startup script outside any repository.
+skipping any already running.
+
 
 Worth knowing: of those six, **none is configured in `~/.claude.json`**, where
 `shadow-core-sentinel` is the only registered MCP server. They start at every
@@ -85,13 +83,13 @@ restart the process:
 
 ```powershell
 Invoke-RestMethod -Method POST http://127.0.0.1:7702/admin/shutdown
-powershell -File "E:\AI Backup Projects\start-shadow-core-mcp.ps1"
+powershell -File "C:\path\to\start-mcp-servers.ps1"
 ```
 
 `install.ps1` below is for a **fresh machine, or Sentinel on its own** — a
 checkout with no orchestrator in front of it. If you later want Sentinel managed
-by this repo rather than the shared script, remove it from the `$exes` list in
-`start-shadow-core-mcp.ps1` first, then install.
+by this repo rather than an external script, remove it from your external startup
+script first, then install.
 
 ---
 

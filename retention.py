@@ -52,7 +52,7 @@ _LOOSE_PATTERNS = (
 )
 
 # An audit root shallower than this is refused outright. `C:\` has 1 part and
-# `E:\audit` has 2; anything that short is far more likely to be a
+# `C:\audit` has 2; anything that short is far more likely to be a
 # misconfiguration than a real audit directory.
 _MIN_PATH_PARTS = 3
 

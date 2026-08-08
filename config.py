@@ -125,7 +125,7 @@ class Settings:
         # NAME, and the loop below matches bare names against every component of
         # every path in every watched project.
         #
-        # Measured: pivoting to `E:\AI Backup Projects` derived the anchor
+        # Measured: pivoting to a workspace derived the anchor
         # `Shadow-Core Sentinel` and appended it, after which
         # `is_ignored(...\Shadow-Core Sentinel\main.py)` returned True — Sentinel
         # silently stopped recording its own repository, and would stop recording
